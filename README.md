@@ -76,11 +76,23 @@ Relay shared secrets are stored in `pi-freeflow-relay-state.json` under
 `PI_FREEFLOW_DATA_DIR` (default `~/.pi/agent`). Exports strip those secrets
 unless `/freeflow export [path] --include-secrets` is requested.
 
+Cline pool login works like upstream (`login` opens the browser device
+flow, `--key` pastes a grant instead). The pool file is shared with pi/OMP
+sessions (`pi-freeflow-cline-pool.json` beside the relay state):
+
+```
+/freeflow cline login            # browser device flow, next free slot
+/freeflow cline login --key work # paste a workos: grant or clp_ key
+/freeflow cline accounts         # saved logins with usage
+/freeflow cline logout slot-2    # drop one login (slot required when several)
+/freeflow cline signout           # browser sign-out link for switching accounts
+```
+
 Other commands: `status`, `models`, `auto`, `spread`, `on`, `off`,
 `add <URL> [name]`, `url [URL]`, `remove <target>`, `kill`, `refresh`,
 `debug on|off`, `export [path] [--include-secrets]`, `import <path> --replace`.
 The command layer still reports unsupported host-specific upstream commands
-(Cline login, startup installation, widget controls, and vendor updates).
+(startup installation, widget controls, and vendor updates).
 
 ## Verification
 

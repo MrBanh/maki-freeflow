@@ -4,9 +4,6 @@
 --   use <target> [new-label], label|rename <target> <name>, remove <target>,
 --   kill, refresh, debug on|off, export/import, deploy, test, url.
 -- CUT (with reasons, flashed when invoked):
---   cline login/accounts . WorkOS device flow + multi-slot pool (38KB
---                          cline-accounts.ts); nothing to log into from maki
---                          (daemon auth is the static `public` bearer).
 --   export --dry-run .... dropped; import requires explicit --replace and
 --   import --merge ...... has no merge mode (replace only).
 --   logs ................ read the log file directly (path in status).
@@ -19,7 +16,6 @@
 local M = {}
 
 local CUT = {
-  cline = "cline pool login is cut in the maki port — Cline-pool models need a pool file from a pi/OMP session",
   logs = "logs are cut — read the daemon log file directly (see /freeflow status for the state dir)",
   log = "logs are cut — read the daemon log file directly (see /freeflow status for the state dir)",
   trace = "trace is cut — read the daemon log file directly (see /freeflow status for the state dir)",
@@ -36,6 +32,7 @@ local USAGE = "freeflow: status | list | models | auto | spread | on | off"
   .. " | remove <target> | kill | refresh | debug on|off"
   .. " | export [path] [--include-secrets] | import <path> --replace"
   .. " | deploy [cloudflare|deno|vercel] [name] | test [target] [--chat] | url [URL]"
+  .. " | cline login [--key] [slot] | cline accounts | cline logout [slot] | cline signout"
 
 local function flash(msg)
   maki.ui.flash(msg)
@@ -501,6 +498,8 @@ function M.dispatch(raw_args)
     do_test(relay, vendor_dir, rest)
   elseif sub == "url" then
     do_url(relay, vendor_dir, rest)
+  elseif sub == "cline" then
+    require("freeflow.cline").dispatch(rest)
   else
     flash("Unknown /freeflow subcommand '" .. sub .. "' — " .. USAGE)
   end
