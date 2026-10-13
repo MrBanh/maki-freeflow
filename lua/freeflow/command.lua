@@ -1,46 +1,41 @@
--- /freeflow slash command (args-only MVP subset).
+-- /freeflow slash command.
 --
 -- KEPT: status, list, models, auto, spread, on, off, add <URL> [name],
 --   use <target> [new-label], label|rename <target> <name>, remove <target>,
---   kill, refresh, debug on|off, export [path], import <path> --replace.
+--   kill, refresh, debug on|off, export/import, deploy, test, url.
 -- CUT (with reasons, flashed when invoked):
---   deploy * ............ needs cloud CLIs + OAuth; add relays via `add`.
 --   cline login/accounts . WorkOS device flow + multi-slot pool (38KB
 --                          cline-accounts.ts); nothing to log into from maki
 --                          (daemon auth is the static `public` bearer).
 --   export --dry-run .... dropped; import requires explicit --replace and
 --   import --merge ...... has no merge mode (replace only).
---   logs/test ........... logs: read the log file directly (path in status);
---                          test hits live upstreams (rate-limited) — cut.
+--   logs ................ read the log file directly (path in status).
 --   update .............. no host plugin manager for a vendored copy;
 --                          update = re-copy src/ from a fresh clone.
 --   hide/show/widget .... no status widget in maki.
 --   install-startup ..... no startup-installer concept; daemon autostarts.
---   url ................. deploy-pool helper; cut with deploy.
 --   Interactive prompts . add/use/label/remove with no args print usage
 --                          instead of opening input/select menus.
 local M = {}
 
 local CUT = {
-  deploy = "deploy is cut in the maki port — deploy a relay manually, then /freeflow add <URL>",
   cline = "cline pool login is cut in the maki port — Cline-pool models need a pool file from a pi/OMP session",
   logs = "logs are cut — read the daemon log file directly (see /freeflow status for the state dir)",
   log = "logs are cut — read the daemon log file directly (see /freeflow status for the state dir)",
   trace = "trace is cut — read the daemon log file directly (see /freeflow status for the state dir)",
-  test = "test is cut — it spends live upstream quota on rate-limited free tiers",
   update = "update is cut — update by re-copying src/*.ts from a fresh pi-freeflow clone",
   hide = "no status widget in maki — nothing to hide",
   show = "no status widget in maki — nothing to show",
   widget = "no status widget in maki",
   ["install-startup"] = "cut — the daemon autostarts on demand, no installer needed",
   ["uninstall-startup"] = "cut — nothing was installed",
-  url = "cut with deploy — use /freeflow add <URL> directly",
 }
 
 local USAGE = "freeflow: status | list | models | auto | spread | on | off"
   .. " | add <URL> [name] | use <target> | label <target> <name>"
   .. " | remove <target> | kill | refresh | debug on|off"
-  .. " | export [path] | import <path> --replace"
+  .. " | export [path] [--include-secrets] | import <path> --replace"
+  .. " | deploy [cloudflare|deno|vercel] [name] | test [target] [--chat] | url [URL]"
 
 local function flash(msg)
   maki.ui.flash(msg)
@@ -344,18 +339,73 @@ end
 
 local function do_export(relay, rest)
   local words = split_words(rest)
-  local dest = words[1] or "pi-freeflow-export.json"
+  local dest = "pi-freeflow-export.json"
+  local include_secrets = false
+  for _, word in ipairs(words) do
+    if word == "--include-secrets" then
+      include_secrets = true
+    elseif word:match("^%-%-") then
+      flash("Usage: /freeflow export [path] [--include-secrets]")
+      return
+    else
+      dest = word
+    end
+  end
   local text, err = maki.fs.read(relay.state_file())
   if err then
     flash("Export failed: no state file yet (" .. tostring(err) .. ")")
     return
   end
+  local valid, state = pcall(maki.json.decode, text)
+  if not valid or type(state) ~= "table" then flash("Export failed: corrupt relay state"); return end
+  if not include_secrets then
+    for _, entry in ipairs(state.relays or {}) do entry.auth = nil end
+  end
+  text = maki.json.encode(state)
   local ok, werr = maki.fs.write(dest, text)
   if not ok then
     flash("Export failed: " .. tostring(werr))
     return
   end
-  flash("Exported relay state to " .. dest)
+  flash("Exported relay state to " .. dest .. (include_secrets and " (includes relay secrets)" or " (relay secrets stripped)"))
+end
+
+local function do_test(relay, vendor_dir, rest)
+  local target = nil
+  local chat = false
+  for _, word in ipairs(split_words(rest)) do
+    if word == "--chat" then chat = true
+    elseif word:match("^%-%-") or target then
+      flash("Usage: /freeflow test [URL|name|index|opencode] [--chat]")
+      return
+    else target = word end
+  end
+  local js = "const { probeRelay } = await import(VENDOR + '/src/probe.ts');"
+    .. "const s = relay.loadRelayState(); const target = " .. maki.json.encode(target or "") .. ";"
+    .. "const direct = target === 'opencode' || target === 'direct';"
+    .. "const entry = relay.findRelay(s, target || s.url);"
+    .. "const url = direct ? 'https://opencode.ai' : entry?.url || target || s.url;"
+    .. "if (!url) throw new Error('No saved relays — deploy one with /freeflow deploy');"
+    .. "out.probe = await probeRelay(url, entry?.auth, { endpoint: " .. maki.json.encode(chat and "chat" or "models") .. " });"
+    .. "out.url = url; out.ok = true;"
+  local out, err = relay.run_shim(js, vendor_dir)
+  if not out then flash("Relay test failed: " .. tostring(err)); return end
+  local probe = out.probe or {}
+  flash(out.url .. (probe.ok and " reachable" or " unreachable") .. " (HTTP " .. tostring(probe.status)
+    .. ", " .. tostring(probe.latencyMs) .. "ms)" .. (probe.error and (": " .. probe.error) or ""))
+end
+
+local function do_url(relay, vendor_dir, rest)
+  if rest == "" then
+    local state = relay.read_state() or {}
+    flash("Active relay URL: " .. tostring(state.url or "") .. " | /freeflow url <URL> to set")
+    return
+  end
+  local js = "const next = relay.withRelayState((s) => { const r = relay.ensureRelay(s, "
+    .. maki.json.encode(rest) .. "); s.url = r.url; return s; }); out.ok = true; out.state = next;"
+  local out, err = relay.run_shim(js, vendor_dir)
+  if not out then flash("freeflow url failed: " .. tostring(err)); return end
+  flash(relay.flash_summary(out.state))
 end
 
 local function do_import(relay, rest)
@@ -434,6 +484,12 @@ function M.dispatch(raw_args)
     do_export(relay, rest)
   elseif sub == "import" then
     do_import(relay, rest)
+  elseif sub == "deploy" then
+    require("freeflow.deploy").dispatch(rest)
+  elseif sub == "test" then
+    do_test(relay, vendor_dir, rest)
+  elseif sub == "url" then
+    do_url(relay, vendor_dir, rest)
   else
     flash("Unknown /freeflow subcommand '" .. sub .. "' — " .. USAGE)
   end

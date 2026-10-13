@@ -5,6 +5,8 @@
 # env: PI_FREEFLOW_DATA_DIR override + homedir resolution (maki.uv.os_getenv,
 #   maki.uv.os_homedir) and config_dir fallback for the vendor tree.
 # run: daemon spawn + `node -e` relay/HTTP shims (maki.fn.jobstart/jobwait).
+#   Deploy jobs call the vendored Vercel/Cloudflare/Deno APIs; API tokens
+#   are passed in the child environment and are never saved to files.
 #   Lua-side daemon HTTP intentionally goes through node shims, not maki.net
 #   (see daemon.lua: ThirdParty plugins get no loopback vouching without
 #   net.allowed_private_hosts in maki.setup).
