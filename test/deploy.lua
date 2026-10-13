@@ -43,6 +43,7 @@ maki = {
 }
 package.loaded["freeflow.daemon"] = {
   node_runtime = function() return { kind = "node", bin = "node" } end,
+  ensure_dependencies = function() return true end,
   vendor_dir = function() return "vendor" end,
 }
 encoded.progress = { type = "progress", message = "Uploading" }

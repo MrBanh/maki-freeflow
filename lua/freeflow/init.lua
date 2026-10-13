@@ -12,6 +12,7 @@
 --
 -- Loaded as the maki-freeflow package: the maki.pack.add custom loader calls
 -- require("freeflow").setup({ vendor_dir = package.path .. "/vendor" }).
+-- The default plugin entry also works: daemon.lua resolves the package path.
 -- setup() takes no other options today; vendor_dir is the only input.
 local chat_rows = require("freeflow.models_chat")
 local resp_rows = require("freeflow.models_responses")

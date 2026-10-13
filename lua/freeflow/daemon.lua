@@ -30,23 +30,78 @@ local function config_dir()
   return maki.env.config_dir()
 end
 
--- Overridden by setup({ vendor_dir = ... }) when loaded as a package: the
--- maki.pack.add custom loader passes package.path .. "/vendor", which is
--- the only reliable location once maki clones the package to the site dir.
--- The fallback covers a hand-installed copy inside the user config.
+-- Optional setup override; otherwise resolve the package source or managed
+-- checkout metadata. The final fallback supports old in-config installs.
 local vendor_dir_override = nil
 local vendor_version_cache = nil
+local dependencies_ready = false
+local dependencies_installing = false
+
+-- Luau exposes debug.info; ordinary Lua uses debug.getinfo.
+local source = debug and debug.info and debug.info(1, "s")
+  or (debug and debug.getinfo and debug.getinfo(1, "S").source)
+local package_vendor = type(source) == "string"
+  and source:gsub("^@", ""):match("^(.*)/lua/freeflow/daemon%.lua$")
+if package_vendor then package_vendor = package_vendor .. "/vendor" end
 
 function M.set_vendor_dir(dir)
   vendor_dir_override = dir
   vendor_version_cache = nil
+  dependencies_ready = false
 end
 
 function M.vendor_dir()
   if vendor_dir_override ~= nil then
     return vendor_dir_override
   end
+  if package_vendor then return package_vendor end
+  -- Compiled chunks can omit source paths; managed state has the revision dir.
+  if maki.pack and maki.pack.get then
+    local packages = maki.pack.get()
+    for _, package in ipairs(packages or {}) do
+      local src = package.spec.src or ""
+      if package.path and (package.spec.name == "maki-freeflow"
+        or src:gsub("%.git$", ""):match("/maki%-freeflow/?$")) then
+        return package.path .. "/vendor"
+      end
+    end
+  end
   return config_dir() .. "/packages/maki-freeflow/vendor"
+end
+
+local function output_text(res, key)
+  local value = res[key] or res[key .. "_lines"]
+  if type(value) == "table" then return table.concat(value, "\n") end
+  return type(value) == "string" and value or ""
+end
+
+function M.ensure_dependencies(rt)
+  while dependencies_installing do maki.async.sleep(100) end
+  if dependencies_ready then return true end
+  dependencies_installing = true
+  local id, err = maki.fn.jobstart({ rt.bin, M.vendor_dir() .. "/maki-setup.mjs" }, {
+    on_stdout = function(_, line)
+      if line:find("Installing FreeFlow", 1, true) then
+        maki.log.info(line)
+        maki.ui.flash(line)
+      end
+    end,
+  })
+  if not id then
+    dependencies_installing = false
+    return false, "freeflow: dependency setup spawn failed: " .. tostring(err)
+  end
+  local res = maki.fn.jobwait(id, 150000)
+  dependencies_installing = false
+  if not res then
+    maki.fn.jobstop(id)
+    return false, "freeflow: dependency setup timed out; run npm ci --omit=dev in " .. M.vendor_dir()
+  end
+  if res.exit_code ~= 0 then
+    return false, "freeflow: dependency setup failed: " .. output_text(res, "stderr"):sub(-1500)
+  end
+  dependencies_ready = true
+  return true
 end
 
 function M.daemon_entry()
@@ -221,7 +276,7 @@ end
 local runtime_cache = nil
 
 -- Resolve { bin, kind } with kind "node"|"bun", or nil + loud error.
--- node needs major >= 22 (--experimental-strip-types); bun takes anything.
+-- Node needs >=22.19 (the vendored engine requirement); Bun is also supported.
 function M.node_runtime()
   if runtime_cache ~= nil then
     if runtime_cache == false then
@@ -257,7 +312,8 @@ function M.node_runtime()
     local out = stdout_text(res)
     local version = out:match("v?(%d+%.%d+%.?%d*)") or ""
     local major = tonumber(version:match("^(%d+)")) or 0
-    if kind == "node" and major < 22 then
+    local minor = tonumber(version:match("^%d+%.(%d+)")) or 0
+    if kind == "node" and (major < 22 or (major == 22 and minor < 19)) then
       return nil, "node " .. version .. " too old"
     end
     return { bin = bin, kind = kind, version = version }, nil
@@ -327,6 +383,10 @@ end
 -- Ensure a daemon answers on :28180 and hold a lease for client_id.
 -- Returns true + health-ish info on success, false + proxy-down message.
 function M.ensure(client_id)
+  local rt, rt_err = M.node_runtime()
+  if not rt then return false, rt_err end
+  local ready, setup_err = M.ensure_dependencies(rt)
+  if not ready then return false, setup_err end
   local alive = M.probe_alive()
   if alive then
     M.attach(client_id)
@@ -343,23 +403,19 @@ function M.ensure(client_id)
     M.attach(client_id)
     return true, nil
   end
-  local rt, rt_err = M.node_runtime()
-  if not rt then
-    return false, rt_err
-  end
   local id = maki.fn.jobfind(M.JOB_NAME)
   if not id then
     local spawn_id, spawn_err = maki.fn.jobstart(M.spawn_argv(rt), {
       name = M.JOB_NAME,
       scope = "plugin",
       stdout = false,
-      stderr = false,
     })
     if not spawn_id then
       -- A live name under a dying job, or a real spawn failure: re-probe
       -- before giving up (another process may have won the race).
       maki.log.warn("freeflow: daemon spawn failed: " .. tostring(spawn_err))
     else
+      id = spawn_id
       maki.log.info("freeflow: spawning daemon (" .. rt.kind .. " " .. tostring(rt.version or "?") .. ")")
     end
   end
@@ -372,6 +428,12 @@ function M.ensure(client_id)
     return true, nil
   end
   local mapping = require("freeflow.mapping")
+  if id then
+    local res = maki.fn.jobwait(id, 1)
+    if res and res.exit_code ~= 0 then
+      return false, "freeflow: daemon exited " .. tostring(res.exit_code) .. ": " .. output_text(res, "stderr"):sub(-1500)
+    end
+  end
   return false, mapping.proxy_down_message(M.PORT)
 end
 
@@ -384,14 +446,23 @@ end
 -- /reload ends the task and the next load starts a fresh one.
 function M.beat_forever()
   local client_id = M.new_client_id()
-  M.ensure(client_id)
+  local last_error
+  local function ensure()
+    local ok, err = M.ensure(client_id)
+    if not ok and err ~= last_error then
+      maki.log.error(err)
+      maki.ui.flash(err)
+    end
+    last_error = ok and nil or err
+  end
+  ensure()
   while true do
     maki.async.sleep(M.HEARTBEAT_MS)
     local state = M.control("/_client/heartbeat", client_id)
     if state == "unknown" then
       M.attach(client_id)
     elseif state == "gone" then
-      M.ensure(client_id)
+      ensure()
     end
   end
 end

@@ -79,6 +79,8 @@ function M.run(platform, token, name, progress)
   local daemon = require("freeflow.daemon")
   local rt, err = daemon.node_runtime()
   if not rt then return nil, err end
+  local ready, setup_err = daemon.ensure_dependencies(rt)
+  if not ready then return nil, setup_err end
   local argv = { rt.bin }
   if rt.kind ~= "bun" then table.insert(argv, "--experimental-strip-types") end
   table.insert(argv, daemon.vendor_dir() .. "/maki-deploy.mjs")

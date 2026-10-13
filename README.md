@@ -6,7 +6,26 @@ daemon (v1.34.0, MIT © trefeon), vendored verbatim under `vendor/`. See
 
 ## Setup
 
-After cloning, install the daemon's runtime dependency:
+Add this to your global Maki `init.lua`:
+
+```lua
+maki.pack.add({
+  "https://github.com/MrBanh/maki-freeflow",
+})
+```
+
+Restart Maki and approve the package permissions. Requires Node 22.19+
+or Bun, plus npm on PATH for automatic dependency installation. On first
+startup the plugin installs the pinned `undici` dependency into the loaded
+checkout's `vendor/` directory. Each new package revision is set up separately;
+existing installations do not run npm again. The checkout must be writable.
+
+Check readiness with `/freeflow status`, then select a FreeFlow model.
+Deploying a relay is optional; without one, requests go directly upstream.
+
+If automatic setup fails, the notification includes the error and the actual
+vendor directory. Install manually in **that directory** (not a separate
+development clone), then run `/freeflow status`:
 
 ```
 cd vendor && npm ci --omit=dev
@@ -68,6 +87,8 @@ The command layer still reports unsupported host-specific upstream commands
 ```
 node --experimental-strip-types --test test/deploy.test.mjs
 lua test/deploy.lua
+lua test/setup.lua
+node --test test/setup.test.mjs
 ```
 
 Tests mock platform APIs and use an isolated state directory; no cloud
