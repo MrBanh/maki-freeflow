@@ -1,0 +1,1952 @@
+/**
+ * Interactive CLI slash commands and status bar manager for pi-freeflow
+ *
+ * log viewing, debug level configuration, and live catalog refreshing.
+ */
+
+import { spawn } from "node:child_process";
+import { execSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { getClientPort, isJsRuntimeExecutable, resolveDaemonRuntime } from "./client.ts";
+import { refreshCatalog, setAliveCatalog } from "./catalog.ts";
+import { DAEMON_SPAWN_ENV, DATA_DIR_ENV, DEBUG_STATE_FILE, HOST, LOG_FILE, PORT, RELAY_STATE_FILE } from "./config.ts";
+import {
+ compareVersions,
+ fetchLatestVersion,
+ getCachedUpdate,
+ isLinkedInstall,
+ getLocalVersion,
+} from "./update-checker.ts";
+import { isCommandAvailable, selectGlobalUpdatePlan, selectHostUpdateSteps } from "./updater.ts";
+import {
+ deployCloudflareWorker,
+ deployDenoRelay,
+ deployVercelRelay,
+ type DeployPlatform,
+} from "./deploy.ts";
+import {
+ LOG_LEVEL_ORDER,
+ getMinLogLevel,
+ isDebugEnabled,
+ loadDebugState,
+ readRecentLogs,
+ saveDebugState,
+} from "./logger.ts";
+import { probeRelay } from "./probe.ts";
+import { getUpstreamHealth, resetUpstreamGate } from "./upstream-health.ts";
+import {
+ buildRelayExport,
+ ensureRelay,
+ EXPORT_DEFAULT_FILENAME,
+ EXPORT_MAX_BYTES,
+ findRelay,
+ getActiveRelayState,
+ ewmaBadge,
+ getRelayHealth,
+ loadRelayState,
+ parseRelayImport,
+ planRelayImport,
+ removeRelay,
+ setActiveRelayState,
+ setRelayLabel,
+ setStatusUi,
+ shortRelayLabel,
+ withRelayState,
+ formatRelayFlash,
+ formatRelayPickerItem,
+ formatRelayStatusLabel,
+} from "./relay-state.ts";
+import { addAccount, findClineAccountSlot, loadPool, redactedToken, removeAccount } from "./cline-accounts.ts";
+import type { ClinePoolState } from "./cline-accounts.ts";
+import { CLINE_BROWSER_SIGNOUT_URL, pollDeviceToken, registerClineToken, startDeviceAuth, toApiKey } from "./cline-device-auth.ts";
+import { isCertError } from "./system-ca-fetch.ts";
+import type {
+ ExtensionAPI,
+ ExtensionContext,
+ ExtensionUIContext,
+ KnownRelay,
+ LogLevel,
+ RegisteredCommand,
+ RegisteredModel,
+ RelayState,
+} from "./types.ts";
+
+/**
+ * Update the TUI status bar widget with active relay state.
+ */
+export function updateStatusBar(ui?: ExtensionUIContext): void {
+ if (!ui) return;
+ ui.setStatus("freeflow", formatRelayStatusLabel(getActiveRelayState()) ?? undefined);
+}
+
+export const STARTUP_TASK_NAME = "pi-freeflow-daemon";
+export const STARTUP_SERVICE_NAME = "pi-freeflow.service";
+
+let deployProbeRetries = 5;
+let deployProbeRetryDelayMs: number | null = null;
+
+/** Test-only: override post-deploy probe retry count and delay. */
+export function _setDeployProbeOptionsForTest(
+ opts: { retries?: number; retryDelayMs?: number } | null,
+): void {
+ deployProbeRetries = opts?.retries ?? 5;
+ deployProbeRetryDelayMs = opts?.retryDelayMs ?? null;
+}
+
+export interface StartupPlan {
+ platform: string;
+ taskName: string;
+ command: string;
+ filePath: string;
+ fileContent: string;
+ undo: string;
+}
+
+function daemonEntryForStartup(scriptOverride?: string): string {
+ if (scriptOverride) return scriptOverride;
+ try {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "daemon.ts");
+ } catch {
+  return path.join("src", "daemon.ts");
+ }
+}
+
+/**
+ * Build the single-shot login-startup plan without touching the system.
+ * Windows → logon Scheduled Task (schtasks /sc onlogon, single run at logon).
+ * Linux/macOS → user systemd unit (Type=oneshot, WantedBy=default.target).
+ * Pure (testable): all paths/commands are derived from the overrides.
+ */
+export function getStartupPlan(opts?: {
+ platform?: string;
+ homeDir?: string;
+ execPath?: string;
+ scriptPath?: string;
+}): StartupPlan {
+ const platform = opts?.platform ?? process.platform;
+ const home = opts?.homeDir ?? os.homedir();
+ const script = daemonEntryForStartup(opts?.scriptPath);
+ let quoted: string;
+ if (opts?.execPath) {
+  const type = isJsRuntimeExecutable(opts.execPath);
+  if (type === "bun") {
+   quoted = `"${opts.execPath}" "${script}"`;
+  } else {
+   quoted = `"${opts.execPath}" --experimental-strip-types "${script}"`;
+  }
+ } else {
+  const runtime = resolveDaemonRuntime({ scriptPath: script });
+  if (runtime) {
+   if (runtime.runtimeType === "bun") {
+    quoted = `"${runtime.execPath}" "${script}"`;
+   } else {
+    quoted = `"${runtime.execPath}" --experimental-strip-types "${script}"`;
+   }
+  } else {
+   quoted = `"node" --experimental-strip-types "${script}"`;
+  }
+ }
+ if (platform === "win32") {
+  const command = `schtasks /create /tn "${STARTUP_TASK_NAME}" /tr "${quoted.replace(/"/g, "'")}" /sc onlogon /rl limited /f`;
+  return {
+   platform,
+   taskName: STARTUP_TASK_NAME,
+   command,
+   filePath: `Scheduled Task \\${STARTUP_TASK_NAME} (logon trigger, single-shot)`,
+   fileContent: command,
+   undo: `schtasks /delete /tn "${STARTUP_TASK_NAME}" /f`,
+  };
+ }
+ const filePath = path.join(home, ".config", "systemd", "user", STARTUP_SERVICE_NAME);
+ const fileContent = [
+  "[Unit]",
+  "Description=pi-freeflow proxy daemon (single-shot at login)",
+  "After=default.target",
+  "",
+  "[Service]",
+  "Type=oneshot",
+  `ExecStart=${quoted}`,
+  "RemainAfterExit=yes",
+  "",
+  "[Install]",
+  "WantedBy=default.target",
+  "",
+ ].join("\n");
+ return {
+  platform,
+  taskName: STARTUP_SERVICE_NAME,
+  command: `systemctl --user enable ${STARTUP_SERVICE_NAME}`,
+  filePath,
+  fileContent,
+  undo: `systemctl --user disable ${STARTUP_SERVICE_NAME} && rm "${filePath}"`,
+ };
+}
+
+/**
+ * Install the login-startup hook (single-shot, idempotent). Returns whether a
+ * change was made plus the exact undo text for the caller to display.
+ * Refuses when DAEMON_SPAWN=0. Never throws — failures are returned.
+ */
+export function installStartupHook(opts?: {
+ platform?: string;
+ homeDir?: string;
+ execPath?: string;
+ scriptPath?: string;
+}): { ok: boolean; changed: boolean; undo: string; detail: string } {
+ if (process.env[DAEMON_SPAWN_ENV] === "0") {
+  return { ok: false, changed: false, undo: "", detail: "refused: daemon spawn is disabled (DAEMON_SPAWN=0)" };
+ }
+ const plan = getStartupPlan(opts);
+ try {
+  if (plan.platform === "win32") {
+   try {
+    const q = execSync(`schtasks /query /tn "${STARTUP_TASK_NAME}"`, { encoding: "utf8", timeout: 5000, windowsHide: true }) as string;
+    if (q && q.includes(STARTUP_TASK_NAME)) {
+     execSync(plan.command, { timeout: 10_000, stdio: "ignore", windowsHide: true });
+     return { ok: true, changed: false, undo: plan.undo, detail: `already installed — refreshed logon task "${STARTUP_TASK_NAME}" (undo: ${plan.undo})` };
+    }
+   } catch { }
+   execSync(plan.command, { timeout: 10_000, stdio: "ignore", windowsHide: true });
+   return { ok: true, changed: true, undo: plan.undo, detail: `installed logon task "${STARTUP_TASK_NAME}" (undo: ${plan.undo})` };
+  }
+  const dir = path.dirname(plan.filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  let existing = "";
+  try {
+   existing = fs.readFileSync(plan.filePath, "utf8");
+  } catch { }
+  if (existing === plan.fileContent) {
+   return { ok: true, changed: false, undo: plan.undo, detail: `already installed — ${plan.filePath} up to date (undo: ${plan.undo})` };
+  }
+  fs.writeFileSync(plan.filePath, plan.fileContent, "utf8");
+  try {
+   execSync("systemctl --user daemon-reload", { timeout: 10_000, stdio: "ignore" });
+   execSync(plan.command, { timeout: 10_000, stdio: "ignore" });
+  } catch { }
+  return { ok: true, changed: true, undo: plan.undo, detail: `installed ${plan.filePath} (undo: ${plan.undo})` };
+ } catch (e) {
+  return { ok: false, changed: false, undo: plan.undo, detail: `install failed: ${String(e)} (undo: ${plan.undo})` };
+ }
+}
+
+/**
+ * Remove the login-startup hook (idempotent). Returns the undo/redo text.
+ * Refuses when DAEMON_SPAWN=0, matching install.
+ */
+export function uninstallStartupHook(opts?: {
+ platform?: string;
+ homeDir?: string;
+ execPath?: string;
+ scriptPath?: string;
+}): { ok: boolean; changed: boolean; undo: string; detail: string } {
+ if (process.env[DAEMON_SPAWN_ENV] === "0") {
+  return { ok: false, changed: false, undo: "", detail: "refused: daemon spawn is disabled (DAEMON_SPAWN=0)" };
+ }
+ const plan = getStartupPlan(opts);
+ try {
+  if (plan.platform === "win32") {
+   try {
+    execSync(plan.undo, { timeout: 10_000, stdio: "ignore", windowsHide: true });
+    return { ok: true, changed: true, undo: plan.command, detail: `removed logon task "${STARTUP_TASK_NAME}" (re-install: ${plan.command})` };
+   } catch {
+    return { ok: true, changed: false, undo: plan.command, detail: `already removed — no logon task "${STARTUP_TASK_NAME}" found` };
+   }
+  }
+  let existed = false;
+  try {
+   fs.accessSync(plan.filePath, fs.constants.F_OK);
+   existed = true;
+  } catch { }
+  if (!existed) {
+   return { ok: true, changed: false, undo: plan.command, detail: `already removed — no unit file at ${plan.filePath}` };
+  }
+  try {
+   execSync(`systemctl --user disable ${STARTUP_SERVICE_NAME}`, { timeout: 10_000, stdio: "ignore" });
+  } catch { }
+  fs.rmSync(plan.filePath, { force: true });
+  return { ok: true, changed: true, undo: plan.command, detail: `removed ${plan.filePath} (re-install: ${plan.command})` };
+ } catch (e) {
+  return { ok: false, changed: false, undo: plan.undo, detail: `uninstall failed: ${String(e)}` };
+ }
+}
+
+function spawnWithProgress(
+ cmd: string,
+ args: string[],
+ ctx: ExtensionContext,
+ timeoutMs = 120_000,
+): Promise<number> {
+ const { promise, resolve } = Promise.withResolvers<number>();
+ try {
+  const child = spawn(cmd, args, {
+   shell: process.platform === "win32",
+   stdio: "pipe",
+   windowsHide: true,
+  });
+  const timer = setTimeout(() => {
+   try { child.kill(); } catch { }
+   ctx.ui.notify(`spawn ${cmd} timed out after ${timeoutMs}ms — killed`, "warning");
+   resolve(1);
+  }, timeoutMs);
+  try { timer.unref?.(); } catch { }
+  const done = (code: number | null): void => {
+   clearTimeout(timer);
+   resolve(code ?? 0);
+  };
+  child.stdout?.on("data", (d: Buffer) => {
+   const s = String(d).trim();
+   if (s) ctx.ui.notify(s, "info");
+  });
+  child.stderr?.on("data", (d: Buffer) => {
+   const s = String(d).trim();
+   if (s) ctx.ui.notify(s, "info");
+  });
+  child.on("error", (err: Error) => {
+   clearTimeout(timer);
+   ctx.ui.notify(`spawn ${cmd} failed: ${err.message}`, "warning");
+   resolve(1);
+  });
+  child.on("close", done);
+ } catch (e) {
+  ctx.ui.notify(`spawn ${cmd} failed: ${(e as Error).message}`, "warning");
+  resolve(1);
+ }
+ return promise;
+}
+
+/**
+ * Follow-mode log poller: tracks the count of matched lines already printed
+ * and notifies only lines beyond it, so repeated ticks never re-notify the
+ * same tail. One poller at a time — a re-run clears the previous interval.
+ * Stop with stopLogsFollow (session shutdown / non-follow commands).
+ */
+let logsFollowTimer: NodeJS.Timeout | null = null;
+export function stopLogsFollow(): void {
+ if (logsFollowTimer) {
+  clearInterval(logsFollowTimer);
+  logsFollowTimer = null;
+ }
+}
+function startLogsFollow(
+ ctx: ExtensionContext,
+ filterLevel: LogLevel | null,
+ filterReqId: string | null,
+ count: number,
+ filterText: string | null,
+ baselineMatched: number,
+): void {
+ stopLogsFollow();
+ let lastPrinted = baselineMatched;
+ logsFollowTimer = setInterval(() => {
+  try {
+   const tail = readRecentLogs(filterLevel, filterReqId, count, filterText);
+   if (tail.totalMatched < lastPrinted) {
+    // Log rotated/rewritten below the baseline — re-baseline silently.
+    lastPrinted = tail.totalMatched;
+    return;
+   }
+   const newCount = tail.totalMatched - lastPrinted;
+   if (newCount <= 0) return;
+   const newLines = tail.lines.slice(
+    tail.lines.length - Math.min(newCount, tail.lines.length),
+   ).slice(-50);
+   if (newLines.length > 0) {
+    ctx.ui.notify(newLines.join("\n"), "info");
+   }
+   lastPrinted = tail.totalMatched;
+  } catch { }
+ }, 1000);
+ // @ts-ignore allow unref to not block process exit in CLI
+ logsFollowTimer.unref?.();
+}
+
+/**
+ * Pick the login slot when the user gives none: "default" for the first
+ * login, then the smallest free "slot-2", "slot-3", … — never overwriting
+ * a saved login. Pure — takes the pool, returns a name.
+ */
+function nextClineSlot(pool: ClinePoolState): string {
+ if (!pool.accounts.some((a) => a.slot === "default")) return "default";
+ let n = 2;
+ while (pool.accounts.some((a) => a.slot === `slot-${n}`)) n += 1;
+ return `slot-${n}`;
+}
+
+/**
+ * Per-slot usage row as persisted under pool.usage. Read defensively: pools
+ * saved before usage tracking existed carry no such field, so every property
+ * is narrowed at use. Never carries identity — callers map slot to identity.
+ */
+interface ClineUsageRow {
+ served: number;
+ lastAt: number;
+ lastModel: string;
+}
+
+/** Usage map off the pool without depending on the tracking lane's types. */
+function clineUsageRows(pool: ClinePoolState): Record<string, ClineUsageRow> {
+ const raw = (pool as unknown as { usage?: unknown }).usage;
+ if (!raw || typeof raw !== "object") return {};
+ const out: Record<string, ClineUsageRow> = {};
+ for (const [slot, entry] of Object.entries(raw as Record<string, unknown>)) {
+  if (!entry || typeof entry !== "object") continue;
+  const rec = entry as Record<string, unknown>;
+  if (typeof rec.served !== "number" || !(rec.served >= 0)) continue;
+  out[slot] = {
+   served: rec.served,
+   lastAt: typeof rec.lastAt === "number" ? rec.lastAt : 0,
+   lastModel: typeof rec.lastModel === "string" ? rec.lastModel : "",
+  };
+ }
+ return out;
+}
+
+/** Masked identity for NEW display text — the raw email never appears there. */
+function maskClineEmail(email: string): string {
+ const at = email.indexOf("@");
+ if (at <= 0) return "***";
+ const domain = email.slice(at + 1);
+ if (!domain) return "***";
+ return `${email[0]}***@${domain}`;
+}
+
+/** Relative age for a usage timestamp, ISO fallback for old/future values. */
+function clineUsageAge(lastAt: number, now = Date.now()): string {
+ if (!(lastAt > 0)) return "";
+ const diff = now - lastAt;
+ if (diff < 0) return new Date(lastAt).toISOString();
+ if (diff < 60_000) return "just now";
+ if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
+ if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
+ if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)}d ago`;
+ return new Date(lastAt).toISOString();
+}
+
+/** Usage suffix for one account line; zero-state reads `served 0 · never used`. */
+function formatClineUsageSuffix(slot: string, usage: Record<string, ClineUsageRow>, now = Date.now()): string {
+ const row = usage[slot];
+ if (!row || row.served <= 0) return " · served 0 · never used";
+ const age = clineUsageAge(row.lastAt, now);
+ const last = row.lastModel ? ` · last ${row.lastModel}${age ? ` ${age}` : ""}` : "";
+ return ` · served ${row.served}${last}`;
+}
+
+/**
+ * Compact Cline block for the status banner. Masked identity only — the raw
+ * email never appears here even though account lines still show it.
+ */
+function formatClineStatusSnippet(pool: ClinePoolState, now = Date.now()): string {
+ const n = pool.accounts.length;
+ if (!n) return "Cline: no logins";
+ const usage = clineUsageRows(pool);
+ let best: { slot: string; row: ClineUsageRow } | null = null;
+ for (const a of pool.accounts) {
+  const row = usage[a.slot];
+  if (!row || row.served <= 0) continue;
+  if (!best || row.lastAt > best.row.lastAt) best = { slot: a.slot, row };
+ }
+ if (!best) return `Cline: ${n} login(s) · never used`;
+ const account = pool.accounts.find((a) => a.slot === best.slot);
+ const who = account?.email ? maskClineEmail(account.email) : (account?.accountId || best.slot);
+ const model = best.row.lastModel ? ` (${best.row.lastModel})` : "";
+ return `Cline: ${n} login(s) · last used: [${best.slot}] ${who}${model}`;
+}
+
+/** One notify-ready line per saved login, in pool order, with usage. */
+function formatClineAccountLines(pool: ClinePoolState): string[] {
+ const usage = clineUsageRows(pool);
+ return pool.accounts.map((a, idx) => {
+  const star = a.slot === pool.activeSlot ? "*" : " ";
+  const who = a.email || a.accountId;
+  const whoPart = who ? ` ${who}` : "";
+  // Two slots on one account share one quota, so rotation between them buys
+  // nothing. Mark the later one against the earlier slot it duplicates.
+  const earlier = { accounts: pool.accounts.slice(0, idx) };
+  const dup = findClineAccountSlot(earlier, a);
+  const dupPart = dup ? ` — same account as [${dup}]` : "";
+  return `${star} [${idx + 1}] [${a.slot}]${whoPart} key ending ${redactedToken(a.token)}${dupPart}${formatClineUsageSuffix(a.slot, usage)}`;
+ });
+}
+/** User-safe one-line message for caught values (never echoes secrets). */
+function clineErrorMessage(e: unknown): string {
+ if (e instanceof Error && e.message) return e.message;
+ if (typeof e === "string" && e) return e;
+ return "unknown error";
+}
+
+/**
+ * Validate a user-supplied deploy project name before any network call.
+ * Mirrors the cleanup the deploy builders apply (lowercase, runs of
+ * non-[a-z0-9-] become one dash, edge dashes trimmed): a name with no usable
+ * characters would silently fall back to a generic worker name and likely
+ * collide, and an over-long Cloudflare/Deno name would silently truncate to
+ * something the user did not ask for. Pure: never touches disk or network.
+ */
+export function validateDeployProjectName(
+ raw: string,
+ platform: DeployPlatform,
+): { ok: true; name: string } | { ok: false; reason: string } {
+ const clean = (raw || "")
+  .toLowerCase()
+  .replace(/[^a-z0-9-]+/g, "-")
+  .replace(/-{2,}/g, "-")
+  .replace(/^-+|-+$/g, "");
+ if (!clean) {
+  return {
+   ok: false,
+   reason: `Project name '${(raw || "").trim()}' has no usable letters or numbers — use characters a-z, 0-9, '-'`,
+  };
+ }
+ const max = platform === "cloudflare" ? 58 : platform === "deno" ? 32 : 0;
+ if (max > 0 && clean.length > max) {
+  return {
+   ok: false,
+   reason: `Project name '${clean}' is ${clean.length} chars — ${platform === "cloudflare" ? "Cloudflare" : "Deno Deploy"} allows max ${max}. Shorten it and retry`,
+  };
+ }
+ return { ok: true, name: clean };
+}
+export function createCommandSpec(
+ _pi: ExtensionAPI,
+ onCatalogRefreshed?: (models: RegisteredModel[]) => void,
+): Omit<RegisteredCommand, "name"> {
+ return {
+  description:
+   "Relay egress: auto | spread | on | off | hide | show | widget hide/show | status | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | debug on|off | refresh | update | deploy cloudflare | deploy deno | deploy vercel | install-startup | uninstall-startup | cline login [--key] [slot] | cline accounts | cline logout [slot]",
+  getArgumentCompletions: (prefix: string) =>
+   [
+    "auto",
+    "spread",
+    "on",
+    "off",
+    "hide",
+    "widget hide",
+    "widget show",
+    "status",
+    "add",
+    "list",
+    "use",
+    "label",
+    "rename",
+    "remove",
+    "export",
+    "import",
+    "test",
+    "test opencode",
+    "url",
+    "deploy",
+    "deploy cloudflare",
+    "deploy deno",
+    "deploy vercel",
+    "install-startup",
+    "uninstall-startup",
+    "cline",
+    "cline login",
+    "cline login --key",
+    "cline accounts",
+    "cline logout",
+    "refresh",
+    "models",
+    "logs",
+    "debug",
+    "trace",
+   ]
+    .filter((s) => s.startsWith(prefix))
+    .map((s) => ({ value: s, label: s })),
+  handler: async (args: string, ctx: ExtensionContext) => {
+   const parts = String(args || "")
+    .trim()
+    .split(/\s+/);
+   const sub = parts[0] || "";
+   const rest = parts.slice(1).join(" ");
+   let relayState = getActiveRelayState();
+
+   const flash = () => {
+    ctx.ui.notify(formatRelayFlash(relayState), "info");
+   };
+
+   // UI refresh only — every disk write flows through CAS
+   // (withRelayState) so the operation is re-applied to the freshest
+   // on-disk state at write time instead of a stale snapshot.
+   const persist = () => {
+    setStatusUi(ctx.ui);
+    updateStatusBar(ctx.ui);
+   };
+   /** Re-apply an operation to the freshest on-disk state and persist it. */
+   const applyRelayState = (
+    updater: (s: RelayState) => RelayState,
+   ): RelayState => {
+    relayState = withRelayState(updater);
+    return relayState;
+   };
+   const setRelay = (
+    enabled: boolean,
+    url: string,
+    addLabel?: string,
+   ) => {
+    applyRelayState((s) => {
+     s.enabled = enabled;
+     const cleanUrl = (url || "").trim() || "";
+     s.url = cleanUrl;
+     if (cleanUrl) {
+      ensureRelay(s, cleanUrl, addLabel);
+     }
+     return s;
+    });
+   };
+
+   const addRelayInteractive = async () => {
+    const inputUrl = (
+     await ctx.ui.input(
+      "Custom relay URL (e.g. https://my-relay.workers.dev):",
+      "",
+     )
+    )?.trim();
+    if (!inputUrl) {
+     ctx.ui.notify("Cancelled — no URL provided", "warning");
+     return;
+    }
+    const defaultLabel = shortRelayLabel(inputUrl, relayState.relays);
+    const inputLabel = (
+     await ctx.ui.input(
+      "Short name / alias for TUI (e.g. cf-sg, vercel-1):",
+      defaultLabel,
+     )
+    )?.trim() || defaultLabel;
+
+    applyRelayState((s) => {
+     const added = ensureRelay(s, inputUrl, inputLabel);
+     s.enabled = true;
+     s.url = added.url;
+     return s;
+    });
+    persist();
+    flash();
+    ctx.ui.notify(
+     `✓ Added & activated relay [${shortRelayLabel(relayState.url, relayState.relays)}]: ${relayState.url}`,
+     "info",
+    );
+   };
+
+   const editRelayLabelMenu = async () => {
+    if (!relayState.relays.length) {
+     ctx.ui.notify("No saved relays to rename", "warning");
+     return;
+    }
+    const fmt = (r: KnownRelay, idx: number) =>
+     `[${idx + 1}] ${r.label ? `[${r.label}] ` : ""}${r.url}`;
+    const opts = relayState.relays.map(fmt);
+    const choice = await ctx.ui.select("Select relay to rename / set short name", opts);
+    if (!choice) return;
+    const match = relayState.relays.find((r, idx) => fmt(r, idx) === choice);
+    if (!match) return;
+
+    const curLabel = match.label || shortRelayLabel(match.url, relayState.relays);
+    const newLabel = (
+     await ctx.ui.input(
+      `New short name for ${match.url}:`,
+      curLabel,
+     )
+    )?.trim();
+    if (!newLabel) {
+     ctx.ui.notify("Cancelled — short name not changed", "warning");
+     return;
+    }
+    applyRelayState((s) => {
+     setRelayLabel(s, match.url, newLabel);
+     return s;
+    });
+    persist();
+    flash();
+    ctx.ui.notify(
+     `✓ Relay short name updated to [${newLabel}] for ${match.url}`,
+     "info",
+    );
+   };
+
+   const DEPLOY_OPTIONS: Record<string, DeployPlatform> = {
+    "Cloudflare (100k req/day — recommended)": "cloudflare",
+    "Deno Deploy (100k req/day)": "deno",
+    "Vercel (last resort — Hobby 10GB origin cap)": "vercel",
+   };
+
+   const parseDeployPlatform = (raw?: string): DeployPlatform | null => {
+    const v = (raw || "").trim().toLowerCase();
+    if (!v || v === "cloudflare" || v === "cf") return "cloudflare";
+    if (v === "deno") return "deno";
+    if (v === "vercel") return "vercel";
+    return null;
+   };
+
+   const doDeploy = async (platform: DeployPlatform = "cloudflare") => {
+    const defaultName = `relay-${Date.now().toString(36)}`;
+    const label =
+     platform === "cloudflare"
+      ? "Cloudflare"
+      : platform === "deno"
+       ? "Deno Deploy"
+       : "Vercel";
+    const tokenHint =
+     platform === "cloudflare"
+      ? "Cloudflare relay — token: dash.cloudflare.com → API Tokens (Workers Scripts: Edit)"
+      : platform === "deno"
+       ? "Deno Deploy relay — token: dash.deno.com → Access Tokens"
+       : "Vercel relay — token: vercel.com/account/tokens";
+    ctx.ui.notify(tokenHint, "info");
+    const token = (
+     await ctx.ui.input(`${label} API token:`, "")
+    )?.trim();
+    if (!token) {
+     ctx.ui.notify("Deploy cancelled: no token", "warning");
+     return;
+    }
+    const entered =
+     (
+      await ctx.ui.input(
+       "Project name (empty = auto):",
+       defaultName,
+      )
+     )?.trim() || defaultName;
+    const nameCheck = validateDeployProjectName(entered, platform);
+    if (!nameCheck.ok) {
+     ctx.ui.notify(`Deploy cancelled: ${nameCheck.reason}`, "warning");
+     return;
+    }
+    const name = entered;
+    const cleanName = nameCheck.name;
+    // Never display a short token in full: its "last 4" would be the secret.
+    const tokenTail = token.length > 8 ? token.slice(-4) : "***";
+
+    if (typeof ctx.ui.confirm === "function") {
+     const ok = await ctx.ui.confirm(
+      "Deploy relay",
+      cleanName === name
+       ? `Deploy ${label} relay '${name}' using token ending ${tokenTail}?`
+       : `Deploy ${label} relay '${name}' (as '${cleanName}') using token ending ${tokenTail}?`,
+     );
+     if (!ok) {
+      ctx.ui.notify("Deploy cancelled", "warning");
+      return;
+     }
+    }
+
+    ctx.ui.setStatus("freeflow", `deploying ${platform} relay…`);
+    try {
+     const deployer =
+      platform === "cloudflare"
+       ? deployCloudflareWorker
+       : platform === "deno"
+        ? deployDenoRelay
+        : deployVercelRelay;
+     const { url, auth } = await deployer(token, name, (m) =>
+      ctx.ui.notify(m, "info"),
+     );
+     const finalUrl = url.trim().replace(/\/+$/, "");
+     relayState = withRelayState((s) => {
+      const prevLabel = s.relays.find((r) => r.url === finalUrl)?.label;
+      const r = ensureRelay(s, finalUrl, `deployed ${cleanName}`);
+      if (auth) r.auth = auth;
+      else delete r.auth;
+      // A re-deploy at an existing address refreshes the secret but keeps a
+      // user-chosen short name; only stock `deployed …` labels roll forward.
+      if (prevLabel && !prevLabel.startsWith("deployed ")) r.label = prevLabel;
+      s.enabled = true;
+      s.url = finalUrl;
+      return s;
+     });
+     persist();
+     // saveRelayState swallows disk errors, so confirm the pool entry landed:
+     // otherwise a live deployment would silently vanish on the next restart.
+     let poolSaved = false;
+     try {
+      poolSaved = loadRelayState().relays.some((r) => r.url === finalUrl);
+     } catch {
+      poolSaved = false;
+     }
+     let probeNote = "";
+     try {
+      const retryDelay =
+       deployProbeRetryDelayMs ?? (process.env[DATA_DIR_ENV] ? 10 : 2000);
+      const probe = await probeRelay(finalUrl, auth, {
+       retries: deployProbeRetries,
+       retryDelayMs: retryDelay,
+       onRetry: (attempt, total) => {
+        ctx.ui.notify(
+         `Waiting for edge routing to propagate (${attempt}/${total})…`,
+         "info",
+        );
+       },
+      });
+      probeNote = probe.ok
+       ? ` ✓ reachable (HTTP ${probe.status}, ${probe.latencyMs}ms)`
+       : ` ⚠ deployed but unreachable (${probe.error || `HTTP ${probe.status}`}) — run /freeflow test ${finalUrl} to retry, or /freeflow remove ${finalUrl} to drop it`;
+     } catch {
+      // probeRelay never throws, but keep the notify safe regardless
+     }
+     if (!poolSaved) {
+      const secretNote = auth
+       ? " Note: this relay uses a shared secret, so prefer redeploying if the re-added copy fails its probe."
+       : "";
+      ctx.ui.notify(`⚠ Relay is live at ${finalUrl} but NOT saved to the pool (disk write failed)${probeNote} — restore it with: /freeflow add ${finalUrl}.${secretNote}`, "error");
+      return;
+     }
+     ctx.ui.notify(`✓ Deployed & active: ${finalUrl}${probeNote}`, "info");
+    } catch (e) {
+     updateStatusBar(ctx.ui);
+     // Deploy errors echo upstream detail; never let the platform API token
+     // leak through a message that repeats what the server (or network) said.
+     const rawMsg = (e as Error).message;
+     const safeMsg = token.length >= 8 ? rawMsg.split(token).join("[redacted]") : rawMsg;
+     ctx.ui.notify(
+      `Deploy failed: ${safeMsg}`,
+      "error",
+     );
+    }
+   };
+
+   const switchRelay = async () => {
+    if (!relayState.relays.length) {
+     ctx.ui.notify("No saved relays yet", "warning");
+     return;
+    }
+    const fmt = (r: KnownRelay, idx: number) => formatRelayPickerItem(r, idx, relayState.url);
+    const opts = relayState.relays.map(fmt);
+    const choice = await ctx.ui.select("Switch active relay", opts);
+    if (!choice) return;
+    const match = relayState.relays.find((r, idx) => fmt(r, idx) === choice);
+    if (!match) return;
+    applyRelayState((s) => {
+     const fresh = s.relays.find((r) => r.url === match.url);
+     if (!fresh) return s;
+     s.enabled = true;
+     s.url = fresh.url;
+     return s;
+    });
+    persist();
+    flash();
+   };
+
+   const showList = () => {
+    if (!relayState.relays.length) {
+     ctx.ui.notify("No saved relays (direct upstream mode)", "info");
+     return;
+    }
+    const isDeadParked = (url: string): boolean => {
+     const h = getRelayHealth(url);
+     return h != null && h.lastStatus === 402 && Date.now() < h.cooldownUntil;
+    };
+    const lines = relayState.relays.map((r, idx) => {
+     const star = r.url === relayState.url ? "★" : " ";
+     const shortName = r.label ? `[${r.label}]` : `[${shortRelayLabel(r.url, relayState.relays)}]`;
+     const paddedName = shortName.padEnd(16, " ");
+     const health = getRelayHealth(r.url);
+     const isCooling = health && Date.now() < health.cooldownUntil;
+     const remainingSec = isCooling ? Math.ceil((health.cooldownUntil - Date.now()) / 1000) : 0;
+     const healthBadge = isDeadParked(r.url)
+      ? ` ✖ [dead — HTTP 402 disabled deployment, parked ${remainingSec}s]`
+      : isCooling
+       ? ` ⚠️ [cooling ${remainingSec}s: ${health.lastStatus ? `HTTP ${health.lastStatus}` : "error"}]`
+       : health?.lastLatencyMs != null && Number.isFinite(health.lastLatencyMs)
+        ? ` ✓ [${health.lastLatencyMs}ms]${ewmaBadge(health)}`
+        : " ✓";
+     const counterText = health && (health.successCount != null || health.failureCount != null)
+      ? ` ${health.successCount ?? 0} ok / ${health.failureCount ?? 0} fail`
+      : "";
+     return `${star} [${idx + 1}] ${paddedName} → ${r.url}${healthBadge}${counterText}`;
+    });
+    const activeLabel = shortRelayLabel(relayState.url, relayState.relays);
+    const activeIdx = Math.max(
+     1,
+     relayState.relays.findIndex((r) => r.url === relayState.url) + 1,
+    );
+    const modeStr = (relayState.mode || "auto").toUpperCase();
+    const header = `Saved Relays (${relayState.relays.length}):\n${lines.join("\n")}\n\nActive: [${activeIdx}] ${activeLabel} | Mode: ${modeStr} (${relayState.enabled ? "ON" : "OFF"})`;
+    ctx.ui.notify(header, "info");
+   };
+
+   const removeRelayMenu = async () => {
+    const removable = relayState.relays.filter(
+     (r) => r.url !== relayState.url,
+    );
+    if (!removable.length) {
+     ctx.ui.notify(
+      "Nothing to remove — the active relay cannot be removed (switch first)",
+      "warning",
+     );
+     return;
+    }
+    const fmt = (r: KnownRelay, idx: number) => formatRelayPickerItem(r, idx);
+    const choice = await ctx.ui.select(
+     "Remove relay",
+     removable.map(fmt),
+    );
+    if (!choice) return;
+    const match = removable.find((r, idx) => fmt(r, idx) === choice);
+    if (!match) return;
+    applyRelayState((s) => {
+     removeRelay(s, match.url);
+     return s;
+    });
+    persist();
+    ctx.ui.notify(`Removed: [${shortRelayLabel(match.url, relayState.relays)}] ${match.url}`, "info");
+   };
+   const classifyImportFailure = (filePath: string, raw: string): string => {
+    let parsed: unknown = null;
+    try {
+     parsed = JSON.parse(raw);
+    } catch (e) {
+     return `Relay file ${filePath} is not valid JSON (${(e as Error).message}). Nothing changed.`;
+    }
+    const version = parsed !== null && typeof parsed === "object" && "version" in parsed
+     ? parsed.version
+     : undefined;
+    if (typeof version !== "undefined" && version !== 1) {
+     return `Relay file ${filePath} uses version ${String(version)}, this version understands version 1. Update then try again. Nothing changed.`;
+    }
+    return `Relay file ${filePath} is not a relay export (missing relay list). Nothing changed.`;
+   };
+
+   const runExport = async (pathArg?: string, includeSecrets = false) => {
+    let state: RelayState;
+    try {
+     state = getActiveRelayState();
+    } catch {
+     state = loadRelayState();
+    }
+    const artifact = buildRelayExport(state, { includeSecrets });
+    const count = artifact.state.relays.length;
+    let target = pathArg ? path.resolve(pathArg) : path.resolve(EXPORT_DEFAULT_FILENAME);
+    if (!pathArg) {
+     const choice = await ctx.ui.select("Share relays (export file)", [
+      `Export to ${target}`,
+      "Choose another path…",
+      "Cancel",
+     ]);
+     if (!choice || choice === "Cancel") return;
+     if (choice === "Choose another path…") {
+      const picked = (await ctx.ui.input("Export path:", target))?.trim();
+      if (!picked) return;
+      target = path.resolve(picked);
+     }
+    }
+    if (fs.existsSync(target)) {
+     if (typeof ctx.ui.confirm === "function") {
+      const ok = await ctx.ui.confirm(
+       "Export relays",
+       `File already exists: ${target}\nOverwrite it?`,
+      );
+      if (!ok) {
+       ctx.ui.notify("Export cancelled — existing file left alone", "warning");
+       return;
+      }
+     }
+    }
+    try {
+     fs.writeFileSync(target, JSON.stringify(artifact, null, 2));
+    } catch (e) {
+     ctx.ui.notify(`Could not write relay file ${target}: ${(e as Error).message}.`, "error");
+     return;
+    }
+    updateStatusBar(ctx.ui);
+    flash();
+    ctx.ui.notify(
+     includeSecrets
+      ? `Exported ${count} relay(s) to ${target} WITH passwords included — keep this file private.`
+      : `Exported ${count} relay(s) to ${target} (passwords stripped — file is safe to share).`,
+     "info",
+    );
+   };
+
+   const runImport = async (
+    pathArg: string | undefined,
+    mode: "merge" | "replace",
+    dryRun: boolean,
+   ) => {
+    const filePath = (pathArg || "").trim();
+    if (!filePath) {
+     ctx.ui.notify("Usage: /freeflow import <path> [--merge|--replace] [--dry-run] — path is required.", "warning");
+     return;
+    }
+    let byteSize = 0;
+    try {
+     const st = fs.statSync(filePath);
+     if (!st.isFile()) {
+      ctx.ui.notify(`Could not read relay file ${filePath}: not a regular file.`, "error");
+      return;
+     }
+     byteSize = st.size;
+    } catch (e) {
+     const code = e !== null && typeof e === "object" && "code" in e ? e.code : undefined;
+     if (code === "ENOENT") {
+      ctx.ui.notify(`Relay file not found: ${filePath} — check the path and try again.`, "warning");
+     } else {
+      ctx.ui.notify(`Could not read relay file ${filePath}: ${(e as Error).message}.`, "error");
+     }
+     return;
+    }
+    if (byteSize > EXPORT_MAX_BYTES) {
+     ctx.ui.notify(`Relay file ${filePath} is too large (${byteSize} bytes; limit ${EXPORT_MAX_BYTES} bytes). Nothing changed.`, "warning");
+     return;
+    }
+    let raw: string;
+    try {
+     raw = fs.readFileSync(filePath, "utf8");
+    } catch (e) {
+     ctx.ui.notify(`Could not read relay file ${filePath}: ${(e as Error).message}.`, "error");
+     return;
+    }
+    let fragment: Pick<RelayState, "mode" | "enabled" | "url" | "relays" | "hideWidget">;
+    let parseSkipped: Array<{ index: number; url: string; reason: string }> = [];
+    try {
+     const parsed = parseRelayImport(raw);
+     fragment = parsed.fragment;
+     parseSkipped = parsed.skipped;
+    } catch {
+     ctx.ui.notify(classifyImportFailure(filePath, raw), "warning");
+     return;
+    }
+    if (!fragment || !Array.isArray(fragment.relays) || fragment.relays.length === 0) {
+     if (parseSkipped.length > 0) {
+      ctx.ui.notify(`Relay file ${filePath} holds no usable relay addresses (${parseSkipped.length} skipped: ${parseSkipped[0].reason}). Nothing changed.`, "warning");
+     } else {
+      ctx.ui.notify(`Relay file ${filePath} holds no usable relay addresses (0 skipped). Nothing changed.`, "warning");
+     }
+     return;
+    }
+    const plan = planRelayImport(loadRelayState(), fragment, { mode });
+    const skipped = [...parseSkipped];
+    for (const s of plan.skipped) {
+     if (!skipped.some((x) => x.index === s.index && x.url === s.url)) skipped.push(s);
+    }
+    const skippedCount = skipped.length;
+    const reasons = skippedCount > 0
+     ? skipped.map((s) => s.reason).filter((r, i, arr) => arr.indexOf(r) === i).join("; ")
+     : "none";
+    const plannedActive = plan.next.url
+     ? `[${shortRelayLabel(plan.next.url, plan.next.relays)}]`
+     : "none";
+    if (dryRun) {
+     if (mode === "replace") {
+      ctx.ui.notify(`DRY RUN — replace from ${filePath}: would install ${plan.added}, would remove ${plan.removed}, would skip ${skippedCount} (${reasons}). Active relay would be ${plannedActive}. Nothing changed.`, "info");
+     } else {
+      ctx.ui.notify(`DRY RUN — merge from ${filePath}: would add ${plan.added}, would update short name on ${plan.updated}, would skip ${skippedCount} (${reasons}). Active and mode unchanged. Nothing changed.`, "info");
+     }
+     return;
+    }
+    if (mode === "replace") {
+     ctx.ui.notify(`Replace from ${filePath}: will install ${plan.added}, remove ${plan.removed}, skip ${skippedCount} (${reasons}). Active relay will be ${plannedActive}.`, "info");
+     if (typeof ctx.ui.confirm === "function") {
+      const ok = await ctx.ui.confirm(
+       "Replace all relays?",
+       `Install ${plan.added} relay(s) from ${filePath} and remove ${plan.removed} existing? This cannot be undone.`,
+      );
+      if (!ok) {
+       ctx.ui.notify("Replace cancelled — relay list unchanged.", "warning");
+       return;
+      }
+     }
+    }
+    applyRelayState((s) => planRelayImport(s, fragment, { mode }).next);
+    persist();
+    flash();
+    if (mode === "replace") {
+     const activeName = relayState.url
+      ? `[${shortRelayLabel(relayState.url, relayState.relays)}]`
+      : "none";
+     ctx.ui.notify(`Replaced relay list from ${filePath}: installed ${plan.added}, skipped ${skippedCount}. Active relay is now ${activeName}.`, "info");
+    } else {
+     ctx.ui.notify(`Merge from ${filePath}: added ${plan.added}, updated short name on ${plan.updated}, skipped ${skippedCount}. Relay list now holds ${relayState.relays.length}.`, "info");
+    }
+    const withoutPassword = relayState.relays.filter((r) => !r.auth).length;
+    if (withoutPassword > 0) {
+     ctx.ui.notify(`${withoutPassword} relay(s) have no password — reconnect each one before use.`, "warning");
+    }
+    for (const s of skipped) {
+     const shown = s.url || `#${s.index + 1}`;
+     const reason = s.reason.endsWith(".") ? s.reason : `${s.reason}.`;
+     ctx.ui.notify(`Skipped ${shown}: ${reason}`, "warning");
+    }
+   };
+
+   if (sub === "auto") {
+    applyRelayState((s) => {
+     s.mode = "auto";
+     s.enabled = true;
+     s.url = s.url || "";
+     if (s.url) {
+      ensureRelay(s, s.url);
+     }
+     return s;
+    });
+    persist();
+    flash();
+   } else if (sub === "spread") {
+    applyRelayState((s) => {
+     s.mode = "spread";
+     s.enabled = true;
+     s.url = s.url || "";
+     if (s.url) {
+      ensureRelay(s, s.url);
+     }
+     return s;
+    });
+    persist();
+    flash();
+   } else if (sub === "on") {
+    applyRelayState((s) => {
+     s.mode = "on";
+     s.enabled = true;
+     s.url = s.url || "";
+     if (s.url) {
+      ensureRelay(s, s.url);
+     }
+     return s;
+    });
+    persist();
+    flash();
+   } else if (sub === "off") {
+    applyRelayState((s) => {
+     s.mode = "off";
+     s.enabled = false;
+     return s;
+    });
+    persist();
+    flash();
+   } else if (sub === "hide" || (sub === "widget" && rest === "hide")) {
+    applyRelayState((s) => ({ ...s, hideWidget: true }));
+    persist();
+    updateStatusBar(ctx.ui);
+    ctx.ui.notify("Widget hidden — use /freeflow show or /freeflow widget show to restore", "info");
+   } else if (sub === "show" || (sub === "widget" && rest === "show")) {
+    applyRelayState((s) => ({ ...s, hideWidget: false }));
+    persist();
+    flash();
+    ctx.ui.notify("Widget shown", "info");
+   } else if (sub === "status") {
+    flash();
+    try {
+     const local = getLocalVersion();
+     let latest: string | null = null;
+     const cached = getCachedUpdate();
+     if (cached && typeof cached.latest === "string") {
+      latest = cached.latest;
+     }
+     if (latest && compareVersions(latest, local) > 0) {
+      ctx.ui.notify(
+       `Update available: ${local} -> ${latest} - run /freeflow update`,
+       "info",
+      );
+     }
+    } catch {
+     // swallow — status banner is best-effort
+    }
+
+    const modeLine =
+     relayState.mode === "off"
+      ? "Mode: off (always direct)"
+      : relayState.mode === "on"
+       ? "Mode: on (always relay)"
+       : relayState.mode === "spread"
+        ? "Mode: spread (rotates across healthy relays, auto-rolls on 429/5xx)"
+        : "Mode: auto (enabled on session, auto-rolls on 429/5xx)";
+    const poolLine = `${relayState.relays.length} relay(s)${relayState.relays.length > 0
+     ? ` | active: ${shortRelayLabel(relayState.url, relayState.relays)}`
+     : ""
+     }`;
+    const stateFileLine = `State file: ${RELAY_STATE_FILE}`;
+    const upstreamLine = (["zen", "kilo"] as const)
+     .map((u) => {
+      const h = getUpstreamHealth(u);
+      return h.gated
+       ? `${u} gated (${h.consecutiveFreeTier403} fails) — new sessions degraded`
+       : `${u} open`;
+     })
+     .join(" | ");
+    const clineLine = formatClineStatusSnippet(loadPool());
+    const deadParked = relayState.relays.filter((r) => {
+     const h = getRelayHealth(r.url);
+     return h != null && h.lastStatus === 402 && Date.now() < h.cooldownUntil;
+    });
+    const deadLine = deadParked.length
+     ? `\nDead relays (HTTP 402 disabled deployment, parked): ${deadParked.map((r) => r.url).join(", ")} — delete the Vercel project, run /freeflow remove <url>, then deploy Cloudflare`
+     : "";
+    ctx.ui.notify(`${modeLine} | ${poolLine}\n${stateFileLine}\nUpstream: ${upstreamLine}\n${clineLine}${deadLine}`, "info");
+   } else if (sub === "kill" || sub === "stop" || sub === "shutdown") {
+    const port = getClientPort() || PORT;
+    try {
+     const res = await fetch(`http://${HOST}:${port}/_shutdown`, {
+      method: "POST",
+      signal: AbortSignal.timeout(1500),
+     });
+     if (res.ok) {
+      ctx.ui.notify("Proxy daemon stopped — next freeflow use restarts it", "info");
+     } else {
+      ctx.ui.notify(`Daemon kill got HTTP ${res.status}`, "warning");
+     }
+    } catch {
+     ctx.ui.notify("Daemon not running or not reachable", "warning");
+    }
+   } else if (sub === "update") {
+    if (isLinkedInstall()) {
+     ctx.ui.notify(
+      "Linked install detected — restart your host app to pick up changes (no update needed).",
+      "info",
+     );
+    } else {
+     try {
+      ctx.ui.notify("Checking for updates…", "info");
+      let latest: string | null = null;
+      try {
+       latest = await fetchLatestVersion();
+      } catch {
+       latest = null;
+      }
+      if (!latest) {
+       const cached = getCachedUpdate();
+       if (cached && typeof cached.latest === "string") {
+        latest = cached.latest;
+       }
+      }
+      if (!latest) {
+       ctx.ui.notify("Could not check latest version (offline?)", "warning");
+      } else {
+       const local = getLocalVersion();
+       const cmp = compareVersions(latest, local);
+       if (cmp <= 0) {
+        ctx.ui.notify(`Already on latest (v${local})`, "info");
+       } else {
+        ctx.ui.notify(`Update available: v${local} → v${latest} — updating…`, "info");
+        // Host plugin managers first (neither host has an `update` action for
+        // registry plugins: omp updates by reinstall, pi updates the named
+        // package). Global npm/bun is the last resort, not the default.
+        let code = 1;
+        let manual = "npm i -g pi-freeflow@latest";
+        let lastStep = "";
+        for (const step of selectHostUpdateSteps({
+         ompAvailable: isCommandAvailable("omp"),
+         piAvailable: isCommandAvailable("pi"),
+        })) {
+         if (lastStep !== "") ctx.ui.notify(`${lastStep} exited ${code} — trying ${step.manual}…`, "info");
+         code = await spawnWithProgress(step.cmd, step.args, ctx);
+         manual = step.manual;
+         lastStep = step.manual;
+         if (code === 0) break;
+        }
+        if (code !== 0) {
+         const plan = selectGlobalUpdatePlan({
+          npmAvailable: isCommandAvailable("npm"),
+          bunAvailable: isCommandAvailable("bun"),
+         });
+         if (plan !== null) {
+          ctx.ui.notify(
+           `${lastStep === "" ? "no host plugin manager found" : `${lastStep} exited ${code}`} — trying ${plan.manual}…`,
+           "info",
+          );
+          manual = plan.manual;
+          code = await spawnWithProgress(plan.cmd, plan.args, ctx);
+         }
+        }
+        if (code === 0) {
+         ctx.ui.notify(`Updated to ${latest} — restart your host app`, "info");
+        } else {
+         ctx.ui.notify(
+          `Update failed (exit ${code}) — try manually: ${manual}`,
+          "warning",
+         );
+        }
+       }
+      }
+     } catch (e) {
+      ctx.ui.notify(`Update failed: ${(e as Error).message} — try manually: npm i -g pi-freeflow@latest`, "warning");
+     }
+    }
+   } else if (sub === "list") {
+    showList();
+   } else if (sub === "add") {
+    if (!rest.trim()) {
+     await addRelayInteractive();
+    } else {
+     const tokens = rest.trim().split(/\s+/);
+     const targetUrl = tokens[0];
+     const customLabel = tokens.slice(1).join(" ").trim() || undefined;
+     try {
+      applyRelayState((s) => {
+       const added = ensureRelay(s, targetUrl, customLabel);
+       s.enabled = true;
+       s.url = added.url;
+       return s;
+      });
+     } catch (e) {
+      ctx.ui.notify((e as Error).message, "warning");
+      return;
+     }
+     persist();
+     flash();
+     ctx.ui.notify(
+      `✓ Added & activated relay [${shortRelayLabel(relayState.url, relayState.relays)}]: ${relayState.url}`,
+      "info",
+     );
+    }
+   } else if (sub === "use") {
+    if (!rest.trim()) {
+     await switchRelay();
+    } else {
+     const tokens = rest.trim().split(/\s+/);
+     const targetToken = tokens[0];
+     const customLabel = tokens.slice(1).join(" ").trim() || undefined;
+     const matched = findRelay(relayState, targetToken);
+     if (matched) {
+      applyRelayState((s) => {
+       const fresh = s.relays.find((r) => r.url === matched.url);
+       if (!fresh) return s;
+       s.enabled = true;
+       s.url = fresh.url;
+       if (customLabel) {
+        fresh.label = customLabel;
+       }
+       return s;
+      });
+      persist();
+      flash();
+     } else {
+      // Only treat unmatched tokens as new relays when they are absolute
+      // http(s) URLs — typos or bad indices must not become saved junk relays.
+      let parsedUrl = null;
+      try {
+       parsedUrl = new URL(targetToken);
+      } catch { }
+      const looksLikeUrl = parsedUrl && (parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:");
+      if (looksLikeUrl) {
+       try {
+        applyRelayState((s) => {
+         const added = ensureRelay(s, targetToken, customLabel);
+         s.enabled = true;
+         s.url = added.url;
+         return s;
+        });
+       } catch (e) {
+        ctx.ui.notify((e as Error).message, "warning");
+        return;
+       }
+       persist();
+       flash();
+      } else {
+       ctx.ui.notify(`Relay '${targetToken}' not found in saved list`, "warning");
+      }
+     }
+    }
+   } else if (sub === "label" || sub === "rename") {
+    if (!rest.trim()) {
+     await editRelayLabelMenu();
+    } else {
+     const tokens = rest.trim().split(/\s+/);
+     const targetToken = tokens[0];
+     const newLabel = tokens.slice(1).join(" ").trim();
+     const matched = findRelay(relayState, targetToken);
+     if (!matched) {
+      ctx.ui.notify(`Relay '${targetToken}' not found in saved list`, "warning");
+      return;
+     }
+     let finalLabel = newLabel;
+     if (!finalLabel) {
+      finalLabel = (
+       await ctx.ui.input(
+        `New short name / alias for ${matched.url}:`,
+        matched.label || shortRelayLabel(matched.url, relayState.relays),
+       )
+      )?.trim() || "";
+     }
+     applyRelayState((s) => {
+      setRelayLabel(s, matched.url, finalLabel);
+      return s;
+     });
+     persist();
+     flash();
+     ctx.ui.notify(
+      `✓ Relay short name updated to [${shortRelayLabel(matched.url, relayState.relays)}] for ${matched.url}`,
+      "info",
+     );
+    }
+   } else if (sub === "debug") {
+    const arg = rest.trim().toLowerCase();
+    if (arg === "on" || arg === "enable" || arg === "true") {
+     saveDebugState({ debug: true });
+     ctx.ui.notify(
+      "🔍 Debug ON — verbose trace enabled (level=debug). Logs now include request IDs, thinking sniffing, and payload normalize details.",
+      "info",
+     );
+    } else if (
+     arg === "off" ||
+     arg === "disable" ||
+     arg === "false"
+    ) {
+     saveDebugState({ debug: false });
+     ctx.ui.notify(
+      `🔇 Debug OFF — level restored to info. File: ${DEBUG_STATE_FILE}`,
+      "info",
+     );
+    } else if (arg.startsWith("level")) {
+     const lvl = arg.split(/\s+/)[1] as LogLevel | undefined;
+     // Allowlist only levels that actually have emitters. 'audit' exists in
+     // LOG_LEVEL_ORDER but nothing ever logs at it, so accepting it here
+     // silently suppressed ALL log output until manually reset.
+     const EMITTED_LEVELS: readonly LogLevel[] = [
+      "debug",
+      "info",
+      "warn",
+      "error",
+     ];
+     if (
+      lvl &&
+      (EMITTED_LEVELS as readonly string[]).includes(lvl)
+     ) {
+      saveDebugState({ debug: false, level: lvl });
+      ctx.ui.notify(
+       `Log level set to ${lvl} (persisted to ${DEBUG_STATE_FILE})`,
+       "info",
+      );
+     } else {
+      ctx.ui.notify(
+       `Unknown level: ${lvl} (use debug/info/warn/error)`,
+       "warning",
+      );
+     }
+    } else {
+     const st = loadDebugState();
+     const cur = st?.debug
+      ? "debug (ON)"
+      : st?.level ||
+      process.env.FREEFLOW_LOG_LEVEL ||
+      "info";
+     ctx.ui.notify(
+      `Debug status: ${cur}\nFile: ${DEBUG_STATE_FILE}\nMinLevel: ${getMinLogLevel()} | isDebug=${isDebugEnabled()}\nUsage: /freeflow debug on|off | /freeflow debug level debug`,
+      "info",
+     );
+    }
+   } else if (sub === "logs" || sub === "log" || sub === "trace") {
+    try {
+     const rawRest = rest.trim();
+     let filterLevel: LogLevel | null = null;
+     let filterReqId: string | null = null;
+     let filterText: string | null = null;
+     let expectRelay = false;
+     let count = 25;
+     const rawTokens = rawRest ? rawRest.split(/\s+/) : [];
+     const isFollow = rawTokens.includes("--follow") || rawTokens.includes("-f");
+
+     if (sub === "trace" && rawRest) {
+      filterReqId = rawTokens.filter((t) => t !== "--follow" && t !== "-f")[0] || null;
+     } else if (rawRest) {
+      for (const t of rawTokens) {
+       if (t === "--follow" || t === "-f") continue;
+       const lower = t.toLowerCase();
+       if (expectRelay) {
+        filterText = t;
+        expectRelay = false;
+        continue;
+       }
+       if (t === "relay") {
+        expectRelay = true;
+        continue;
+       }
+       if (lower in LOG_LEVEL_ORDER) {
+        filterLevel = lower as LogLevel;
+       } else if (/^\d+$/.test(t)) {
+        count = Math.min(
+         200,
+         Math.max(5, Number.parseInt(t, 10)),
+        );
+       } else if (
+        /^[a-f0-9]{6,8}$/i.test(t) ||
+        t.startsWith("req=")
+       ) {
+        filterReqId = t.replace(/^req=/, "");
+       } else if (lower === "trace" || lower === "req") {
+        continue;
+       } else {
+        // Unrecognized token: an invalid level must default to info,
+        // not silently become a request-id filter.
+        filterLevel = filterLevel ?? "info";
+       }
+      }
+     }
+
+     const result = readRecentLogs(
+      filterLevel,
+      filterReqId,
+      count,
+      filterText,
+     );
+     if (result.lines.length === 0) {
+      if (result.totalLines === 0) {
+       ctx.ui.notify(
+        "Log file is empty (no logs yet)",
+        "info",
+       );
+      } else {
+       ctx.ui.notify(
+        `No logs matched (level=${filterLevel || "any"} reqId=${filterReqId || "any"} text=${filterText || "any"} count=${count})`,
+        "warning",
+       );
+      }
+      if (isFollow) {
+       startLogsFollow(
+        ctx,
+        filterLevel,
+        filterReqId,
+        count,
+        filterText,
+        result.totalMatched,
+       );
+      }
+      return;
+     }
+
+     const header = `pi-freeflow logs (last ${result.lines.length}/${result.totalMatched} matched, total ${result.totalLines} lines, file: ${LOG_FILE}${filterLevel ? ` level=${filterLevel}` : ""}${filterReqId ? ` req=${filterReqId}` : ""}${filterText ? ` text=${filterText}` : ""}):`;
+     ctx.ui.notify(
+      `${header}\n\n${result.lines.join("\n")}`,
+      "info",
+     );
+     if (isFollow) {
+      startLogsFollow(
+       ctx,
+       filterLevel,
+       filterReqId,
+       count,
+       filterText,
+       result.totalMatched,
+      );
+     }
+    } catch (e) {
+     ctx.ui.notify(
+      `Could not read log file: ${(e as Error).message}`,
+      "error",
+     );
+    }
+   } else if (
+    sub === "refresh" ||
+    sub === "reload" ||
+    sub === "models"
+   ) {
+    ctx.ui.notify(
+     "Refreshing model catalog from live upstreams…",
+     "info",
+    );
+    const updated = await refreshCatalog(true);
+    setAliveCatalog(updated);
+    resetUpstreamGate("zen");
+    persist();
+    onCatalogRefreshed?.(updated);
+    ctx.ui.notify(
+     `✓ Refreshed ${updated.length} models with full-spec metadata (upstream health reset)!`,
+     "info",
+    );
+   } else if (sub === "remove") {
+    if (!rest.trim()) {
+     await removeRelayMenu();
+    } else {
+     const target = rest.trim();
+     const matched = findRelay(relayState, target);
+     if (!matched) {
+      ctx.ui.notify(`Relay '${target}' not in saved list`, "warning");
+      return;
+     }
+     if (matched.url === relayState.url) {
+      ctx.ui.notify(
+       "Cannot remove the active relay — switch to another relay first",
+       "warning",
+      );
+      return;
+     }
+     applyRelayState((s) => {
+      removeRelay(s, matched.url);
+      return s;
+     });
+     persist();
+     ctx.ui.notify(`Removed: [${shortRelayLabel(matched.url, relayState.relays)}] ${matched.url}`, "info");
+    }
+   } else if (sub === "test") {
+    const tokens = rest.trim() ? rest.trim().split(/\s+/) : [];
+    let target: string | undefined;
+    let chatMode = false;
+    for (const t of tokens) {
+     if (t === "--chat") {
+      chatMode = true;
+     } else if (t.startsWith("--")) {
+      ctx.ui.notify(`Unknown flag ${t} — usage: /freeflow test [target|opencode] [--chat]`, "warning");
+      return;
+     } else if (target === undefined) {
+      target = t;
+     }
+    }
+
+    const isDirect = target !== undefined && (target.toLowerCase() === "opencode" || target.toLowerCase() === "direct");
+    if (isDirect) {
+     ctx.ui.notify(`Testing OpenCode upstream endpoint${chatMode ? " (chat probe)" : ""}…`, "info");
+     const probe = await probeRelay("https://opencode.ai", undefined, {
+      endpoint: chatMode ? "chat" : "models",
+     });
+     if (probe.ok) {
+      ctx.ui.notify(`✓ OpenCode endpoint ok (HTTP ${probe.status}, ${probe.latencyMs}ms)`, "info");
+     } else {
+      ctx.ui.notify(`✗ OpenCode endpoint failed: ${probe.error || `HTTP ${probe.status}`}`, "error");
+     }
+     return;
+    }
+
+    if (!target) {
+     if (relayState.url) {
+      target = relayState.url;
+     } else if (relayState.relays && relayState.relays.length > 0) {
+      target = relayState.relays[0].url;
+     } else {
+      ctx.ui.notify(`Testing OpenCode upstream endpoint${chatMode ? " (chat probe)" : ""}…`, "info");
+      const probe = await probeRelay("https://opencode.ai", undefined, {
+       endpoint: chatMode ? "chat" : "models",
+      });
+      if (probe.ok) {
+       ctx.ui.notify(`✓ OpenCode endpoint ok (HTTP ${probe.status}, ${probe.latencyMs}ms)`, "info");
+      } else {
+       ctx.ui.notify(`✗ OpenCode endpoint failed: ${probe.error || `HTTP ${probe.status}`}`, "error");
+      }
+      return;
+     }
+    }
+
+    const matched = findRelay(relayState, target);
+    if (!matched) {
+     ctx.ui.notify(`Relay '${target}' not in saved list`, "warning");
+     return;
+    }
+    ctx.ui.notify(`Testing ${matched.url}${chatMode ? " (chat probe)" : ""}…`, "info");
+    const probe = await probeRelay(matched.url, matched.auth, {
+     endpoint: chatMode ? "chat" : "models",
+    });
+    if (probe.ok) {
+     ctx.ui.notify(`✓ ${shortRelayLabel(matched.url, relayState.relays)} ok (HTTP ${probe.status}, ${probe.latencyMs}ms)`, "info");
+    } else {
+     ctx.ui.notify(`✗ ${shortRelayLabel(matched.url, relayState.relays)} failed: ${probe.error || `HTTP ${probe.status}`}`, "error");
+    }
+   } else if (sub === "cline") {
+    const tokens = rest.trim() ? rest.trim().split(/\s+/) : [];
+    const action = (tokens[0] || "accounts").toLowerCase();
+    const arg = tokens.slice(1).join(" ").trim();
+    if (action === "login") {
+     const raw = tokens.slice(1);
+     const pasteMode = raw.some((t) => t === "--key");
+     const slotArg = raw.filter((t) => t !== "--key").join(" ").trim();
+     if (pasteMode) {
+      // Manual fallback: paste a workos: API key (never shown back).
+      const slot = slotArg || ((await ctx.ui.input("Cline slot name (empty = default):", "default"))?.trim() || "default");
+      const token = ((await ctx.ui.input(`Paste the API key for Cline slot [${slot}]:`, ""))?.trim() || "");
+      if (!token) {
+       ctx.ui.notify("Cancelled — no API key provided", "warning");
+      } else {
+       try {
+        addAccount(slot, token);
+        ctx.ui.notify(`Saved Cline login [${slot}] (key ending ${redactedToken(token)}) — free Cline models are ready to use`, "info");
+       } catch (e) {
+        ctx.ui.notify((e as Error).message, "warning");
+       }
+      }
+      return;
+     }
+     // Device login inside the extension: approve in the browser, no paste.
+     const slot = slotArg || nextClineSlot(loadPool());
+     let started;
+     try {
+      started = await startDeviceAuth();
+     } catch (e) {
+      if (isCertError(e)) {
+       ctx.ui.notify("Could not reach Cline: your antivirus or network proxy intercepts TLS and Node does not trust it. The login retries with your OS certificates automatically — if this persists, restart the host with NODE_USE_SYSTEM_CA=1 set, or point NODE_EXTRA_CA_CERTS at your proxy CA file.", "error");
+       return;
+      }
+      ctx.ui.notify(`Could not reach Cline to start login: ${clineErrorMessage(e)}`, "error");
+      return;
+     }
+     const link = started.verificationUriComplete ?? started.verificationUri;
+     const minutes = Math.max(1, Math.round(started.expiresIn / 60));
+     const loginLine = `Cline login [${slot}]\nOpen this link in your browser:\n${link}\nEnter code: ${started.userCode} (expires in ~${minutes} min)\nWaiting for approval — approve or cancel in the browser; this finishes on its own.\nDifferent account? Sign out first: ${CLINE_BROWSER_SIGNOUT_URL} (or use a private window)`;
+     ctx.ui.notify(loginLine, "info");
+     try { ctx.ui.setStatus("cline-login", `Cline login [${slot}] code ${started.userCode}`); } catch { }
+     const progress = setInterval(() => {
+      ctx.ui.notify(loginLine, "info");
+     }, 45000);
+     // @ts-ignore allow unref to not block process exit in CLI
+     progress.unref?.();
+     try {
+      const deviceTokens = await pollDeviceToken(undefined, started.deviceCode, started.interval, { maxWaitMs: Math.max(60_000, started.expiresIn * 1000) });
+      const creds = await registerClineToken(undefined, deviceTokens.accessToken, deviceTokens.refreshToken);
+      const apiKey = toApiKey(creds.access);
+      const dup = findClineAccountSlot(loadPool(), { token: apiKey, accountId: creds.accountId, email: creds.email }, slot);
+      if (dup) {
+       // Same account twice shares one free quota, so it would never add capacity.
+       ctx.ui.notify(
+        `That Cline account${creds.email ? ` (${creds.email})` : ""} is already saved as [${dup}] — nothing added.\nUse a different account: /freeflow cline signout shows the sign-out link. Or drop the existing one first: /freeflow cline logout ${dup}`,
+        "warning",
+       );
+       return;
+      }
+      addAccount(slot, apiKey, {
+       refreshToken: creds.refresh,
+       expiresAt: creds.expires,
+       ...(creds.accountId ? { accountId: creds.accountId } : {}),
+       ...(creds.email ? { email: creds.email } : {}),
+      });
+      ctx.ui.notify(`Saved Cline login [${slot}] (key ending ${redactedToken(apiKey)}) — free Cline models are ready to use`, "info");
+      const pool = loadPool();
+      ctx.ui.notify(`Cline logins (${pool.accounts.length}):\n${formatClineAccountLines(pool).join("\n")}`, "info");
+     } catch (e) {
+      let code: string | undefined;
+      if (e && typeof e === "object" && "errorCode" in e && typeof e.errorCode === "string") {
+       code = e.errorCode;
+      }
+      if (code === "access_denied") {
+       ctx.ui.notify("Cline login cancelled.", "warning");
+      } else if (code === "expired_token") {
+       ctx.ui.notify("Cline login code expired — run /freeflow cline login again for a fresh code.", "warning");
+      } else {
+       ctx.ui.notify(`Cline login did not finish: ${clineErrorMessage(e)}`, "warning");
+      }
+     } finally {
+      clearInterval(progress);
+      try { ctx.ui.setStatus("cline-login", undefined); } catch { }
+     }
+    } else if (action === "accounts" || action === "list") {
+     const pool = loadPool();
+     if (!pool.accounts.length) {
+      ctx.ui.notify("No Cline logins saved — add one with /freeflow cline login", "info");
+     } else {
+      ctx.ui.notify(`Cline logins (${pool.accounts.length}):\n${formatClineAccountLines(pool).join("\n")}`, "info");
+     }
+    } else if (action === "logout" || action === "remove") {
+     const pool = loadPool();
+     if (!pool.accounts.length) {
+      ctx.ui.notify("No Cline logins saved — nothing to remove", "info");
+     } else {
+      const resolveSlot = (raw: string): string | null => {
+       const clean = (raw || "").trim();
+       if (!clean) return null;
+       const byIndex = Number.parseInt(clean, 10);
+       if (String(byIndex) === clean && byIndex >= 1 && byIndex <= pool.accounts.length) return pool.accounts[byIndex - 1].slot;
+       const exact = pool.accounts.find((a) => a.slot === clean);
+       if (exact) return exact.slot;
+       const folded = pool.accounts.find((a) => a.slot.toLowerCase() === clean.toLowerCase());
+       return folded ? folded.slot : null;
+      };
+      let slot = resolveSlot(arg);
+      if (arg && !slot) {
+       const saved = pool.accounts.map((a, idx) => `${idx + 1}=${a.slot}`).join(", ");
+       ctx.ui.notify(`Cline slot '${arg}' not found. Saved: ${saved}`, "warning");
+      } else {
+       if (!slot) {
+        if (pool.accounts.length === 1) {
+         slot = pool.accounts[0].slot;
+        } else {
+         const opts = formatClineAccountLines(pool);
+         const choice = await ctx.ui.select("Remove Cline login", [...opts, "Cancel"]);
+         if (!choice || choice === "Cancel") {
+          ctx.ui.notify("Cancelled — no slot removed", "warning");
+          return;
+         }
+         const hit = pool.accounts.find((a, idx) => opts[idx] === choice);
+         slot = hit ? hit.slot : null;
+        }
+       }
+       if (!slot) {
+        ctx.ui.notify("Cancelled — no slot removed", "warning");
+       } else if (!removeAccount(slot)) {
+        ctx.ui.notify(`Cline slot '${slot}' not found`, "warning");
+       } else {
+        ctx.ui.notify(`Removed Cline login [${slot}]`, "info");
+       }
+      }
+     }
+    } else if (action === "signout" || action === "sign-out" || action === "switch") {
+     // Signing out is a browser action; it never touches saved logins here.
+     const saved = loadPool().accounts.length;
+     ctx.ui.notify(
+      `Sign out of Cline in your browser to use a different account:\n${CLINE_BROWSER_SIGNOUT_URL}\nA private window works too, and keeps your current session.\nThen run /freeflow cline login again — each login gets its own slot (${saved ? `you have ${saved}; next is ` : "next is "}${nextClineSlot(loadPool())}).`,
+      "info",
+     );
+    } else {
+     ctx.ui.notify("Usage: /freeflow cline login [--key] [slot] | /freeflow cline accounts | /freeflow cline logout [slot] | /freeflow cline signout", "warning");
+    }
+   } else if (sub === "export") {
+    const tokens = rest.trim() ? rest.trim().split(/\s+/) : [];
+    let target: string | undefined;
+    let includeSecrets = false;
+    for (const t of tokens) {
+     if (t === "--include-secrets") {
+      includeSecrets = true;
+     } else if (t.startsWith("--")) {
+      ctx.ui.notify(`Unknown flag ${t} — usage: /freeflow export [path] [--include-secrets].`, "warning");
+      return;
+     } else if (target === undefined) {
+      target = t;
+     }
+    }
+    await runExport(target, includeSecrets);
+   } else if (sub === "import") {
+    const tokens = rest.trim() ? rest.trim().split(/\s+/) : [];
+    let target: string | undefined;
+    let sawMerge = false;
+    let sawReplace = false;
+    let dryRun = false;
+    for (const t of tokens) {
+     if (t === "--merge") {
+      sawMerge = true;
+     } else if (t === "--replace") {
+      sawReplace = true;
+     } else if (t === "--dry-run") {
+      dryRun = true;
+     } else if (t.startsWith("--")) {
+      ctx.ui.notify(`Unknown flag ${t} — usage: /freeflow import <path> [--merge|--replace] [--dry-run].`, "warning");
+      return;
+     } else if (target === undefined) {
+      target = t;
+     }
+    }
+    if (sawMerge && sawReplace) {
+     ctx.ui.notify("Both --merge and --replace given — showing a merge preview. Nothing changed.", "info");
+     await runImport(target, "merge", true);
+     return;
+    }
+    await runImport(target, sawReplace ? "replace" : "merge", dryRun);
+   } else if (sub === "url") {
+    const input =
+     rest ||
+     (await ctx.ui.input(
+      "Relay URL (empty = default):",
+      relayState.url || "",
+     ));
+    const cleanInput = (input || "").trim() || "";
+    applyRelayState((s) => {
+     s.url = cleanInput;
+     if (cleanInput) {
+      ensureRelay(s, cleanInput, shortRelayLabel(cleanInput, s.relays));
+     }
+     return s;
+    });
+    persist();
+    flash();
+   } else if (sub === "deploy") {
+    if (!rest.trim()) {
+     const choice = await ctx.ui.select(
+      "Deploy relay on",
+      Object.keys(DEPLOY_OPTIONS),
+     );
+     if (choice) await doDeploy(DEPLOY_OPTIONS[choice]);
+    } else {
+     const pf = parseDeployPlatform(rest);
+     if (!pf) {
+      ctx.ui.notify(
+       "Unknown platform. Use: cloudflare | deno | vercel",
+       "warning",
+      );
+     } else {
+      await doDeploy(pf);
+     }
+    }
+   } else if (sub === "install-startup") {
+    const r = installStartupHook();
+    ctx.ui.notify(r.detail, r.ok ? "info" : "warning");
+   } else if (sub === "uninstall-startup") {
+    const r = uninstallStartupHook();
+    ctx.ui.notify(r.detail, r.ok ? "info" : "warning");
+   } else {
+    const currentMode = (relayState.mode || "auto").toUpperCase();
+    const activeLabel = shortRelayLabel(relayState.url, relayState.relays);
+    const choice = await ctx.ui.select("freeflow relay", [
+     `Mode: ${currentMode} (${relayState.enabled ? "ON" : "OFF"}) → ${activeLabel}`,
+     "Add custom relay (URL + Short name)…",
+     "Switch active relay…",
+     "Rename / Set relay short name…",
+     "Remove relay…",
+     "Share relays (export file)…",
+     "Load relays from file (import)…",
+     "List saved relays",
+     "Deploy Cloudflare relay…",
+     "Deploy Deno relay…",
+     "Deploy Vercel relay (last resort)…",
+     "Mode: AUTO (auto-detect on model select)",
+     "Mode: ON (always relay)",
+     "Mode: OFF (always direct)",
+     "Mode: SPREAD (rotate across healthy relays)",
+    ]);
+    if (choice === `Mode: ${currentMode} (${relayState.enabled ? "ON" : "OFF"}) → ${activeLabel}`) {
+     flash();
+    } else if (choice === "Add custom relay (URL + Short name)…") {
+     await addRelayInteractive();
+    } else if (choice === "Switch active relay…") {
+     await switchRelay();
+    } else if (choice === "Rename / Set relay short name…") {
+     await editRelayLabelMenu();
+    } else if (choice === "Remove relay…") {
+     await removeRelayMenu();
+    } else if (choice === "Share relays (export file)…") {
+     await runExport(undefined, false);
+    } else if (choice === "Load relays from file (import)…") {
+     const picked = (await ctx.ui.input("Relay file path:", EXPORT_DEFAULT_FILENAME))?.trim();
+     if (!picked) return;
+     await runImport(picked, "merge", false);
+    } else if (choice === "List saved relays") {
+     showList();
+    } else if (choice === "Deploy Vercel relay (last resort)…") {
+     await doDeploy("vercel");
+    } else if (choice === "Deploy Cloudflare relay…") {
+     await doDeploy("cloudflare");
+    } else if (choice === "Deploy Deno relay…") {
+     await doDeploy("deno");
+    } else if (choice === "Mode: AUTO (auto-detect on model select)") {
+     applyRelayState((s) => {
+      s.mode = "auto";
+      s.enabled = true;
+      s.url = s.url || "";
+      if (s.url) {
+       ensureRelay(s, s.url);
+      }
+      return s;
+     });
+     persist();
+     flash();
+    } else if (choice === "Mode: ON (always relay)") {
+     applyRelayState((s) => {
+      s.mode = "on";
+      s.enabled = true;
+      s.url = s.url || "";
+      if (s.url) {
+       ensureRelay(s, s.url);
+      }
+      return s;
+     });
+     persist();
+     flash();
+    } else if (choice === "Mode: OFF (always direct)") {
+     applyRelayState((s) => {
+      s.mode = "off";
+      s.enabled = false;
+      return s;
+     });
+     persist();
+     flash();
+    } else if (choice === "Mode: SPREAD (rotate across healthy relays)") {
+     applyRelayState((s) => {
+      s.mode = "spread";
+      s.enabled = true;
+      s.url = s.url || "";
+      if (s.url) {
+       ensureRelay(s, s.url);
+      }
+      return s;
+     });
+     persist();
+     flash();
+    }
+   }
+  },
+ };
+}

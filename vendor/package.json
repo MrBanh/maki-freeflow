@@ -1,0 +1,63 @@
+{
+  "name": "pi-freeflow",
+  "type": "module",
+  "version": "1.34.0",
+  "description": "Thin provider for OMP/Pi — model list + dumb relay proxy + log; host pi-ai owns thinking/normalization",
+  "main": "extensions/index.ts",
+  "types": "src/index.ts",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "oh-my-pi",
+    "omp",
+    "free-models",
+    "opencode",
+    "kilocode",
+    "ai-models",
+    "relay"
+  ],
+  "author": "trefeon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/trefeon/pi-freeflow.git"
+  },
+  "homepage": "https://github.com/trefeon/pi-freeflow#readme",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "omp": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --import ./test/setup.mjs --test --test-concurrency=1 test/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node --experimental-strip-types -e \"import('./extensions/index.ts').then(() => console.log('✓ Smoke test passed: extensions/index.ts loaded successfully')).catch(err => { console.error(err); process.exit(1); })\"",
+    "changeset": "changeset",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "vitepress build docs"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.0",
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2",
+    "vitepress": "^1.6.4"
+  },
+  "dependencies": {
+    "undici": "7.30.0"
+  }
+}

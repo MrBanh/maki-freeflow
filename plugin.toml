@@ -1,0 +1,19 @@
+# maki-freeflow: pi-freeflow providers (chat + responses) on a vendored
+# Node daemon with a shared 127.0.0.1 lease.
+#
+# net: provider registration requires net plus a non-empty net_hosts list.
+# env: PI_FREEFLOW_DATA_DIR override + homedir resolution (maki.uv.os_getenv,
+#   maki.uv.os_homedir) and config_dir fallback for the vendor tree.
+# run: daemon spawn + `node -e` relay/HTTP shims (maki.fn.jobstart/jobwait).
+#   Lua-side daemon HTTP intentionally goes through node shims, not maki.net
+#   (see daemon.lua: ThirdParty plugins get no loopback vouching without
+#   net.allowed_private_hosts in maki.setup).
+# fs_read: state/debug reads, vendor package.json version check.
+# fs_write: relay export/import state.
+[permissions]
+net = true
+env = true
+run = true
+fs_read = true
+fs_write = true
+net_hosts = ["127.0.0.1"]
