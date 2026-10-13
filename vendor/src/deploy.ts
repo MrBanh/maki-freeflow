@@ -491,14 +491,23 @@ export async function deployCloudflareWorker(
 type DenoRevision = {
  status?: string;
  failure_reason?: string | null;
- timelines?: Array<{ slug?: string; domains?: Array<{ domain?: string }> }>;
+ timelines?: Array<{
+  slug?: string;
+  name?: string;
+  context?: string;
+  hostnames?: string[];
+  domains?: Array<{ domain?: string }>;
+ }>;
 };
 
 function resolveRoutedDomain(revision: DenoRevision): string | null {
  const timelines = revision.timelines ?? [];
- const production = timelines.find((t) => t.slug === "production") ?? timelines[0];
- const host = (production?.domains ?? [])
-  .map((d) => d.domain ?? "")
+ const production = timelines.find((t) =>
+  [t.slug, t.name, t.context].some((value) => value?.toLowerCase() === "production"),
+ ) ?? timelines[0];
+ // GET /revisions/{id} uses RevisionTimeline.hostnames; the separate
+ // /timelines endpoint and older responses use Timeline.domains.
+ const host = [...(production?.hostnames ?? []), ...(production?.domains ?? []).map((d) => d.domain ?? "")]
   .find((h) => h.length > 0);
  return host ?? null;
 }
@@ -645,6 +654,20 @@ export async function deployDenoRelay(
   log("info", `Deno Deploy relay successfully deployed: ${url}`);
   return { url, auth: relayAuth };
  }
+ // Routing metadata may not yet appear on the revision response. Ask the
+ // dedicated endpoint before relying on the organization's domain list.
+ try {
+  const timelineRes = await fetch(`${DENO_API}/revisions/${revisionId}/timelines`, { headers: auth });
+  if (timelineRes.ok) {
+   const timelines = await timelineRes.json();
+   const host = resolveRoutedDomain({ timelines: Array.isArray(timelines) ? timelines : [] });
+   if (host) {
+    const url = `https://${host}`;
+    log("info", `Deno Deploy relay successfully deployed: ${url}`);
+    return { url, auth: relayAuth };
+   }
+  }
+ } catch { }
  const managed = await firstManagedDenoDomain(token).catch(() => null);
  if (!managed) {
   await deleteApp();

@@ -73,7 +73,10 @@ test("all platform deployers register private relays, preserve labels, and probe
     }
     if (url.endsWith("/revisions/revision-id")) {
      return json(++polls === 1 ? { status: "pending" } : {
-      status: "succeeded", timelines: [{ slug: "production", domains: [{ domain: host }] }],
+      status: "succeeded", timelines: [
+       { name: "Preview", context: "Preview", hostnames: ["preview.deno.net"] },
+       { name: "Production", context: "Production", hostnames: [host] },
+      ],
      });
     }
     if (url.endsWith("/v13/deployments") && init.method === "POST") {
@@ -116,6 +119,24 @@ test("invalid names and platforms are rejected before any API request", async ()
  await assert.rejects(deployRelay("deno", token, "!!!"), /no usable/);
  await assert.rejects(deployRelay("cloudflare", token, "a".repeat(59)), /max 58/);
  await assert.rejects(deployRelay("deno", "", "relay"), /No API token/);
+});
+
+test("Deno resolves routing through the dedicated timelines endpoint when revision routing is empty", async () => {
+ let deleted = false;
+ globalThis.fetch = async (url, init = {}) => {
+  url = String(url);
+  if (init.method === "DELETE") { deleted = true; return json({}); }
+  if (url.endsWith("/apps")) return json({ id: "app" });
+  if (url.endsWith("/apps/app/deploy")) return json({ id: "revision" });
+  if (url.endsWith("/revisions/revision")) return json({ status: "succeeded", timelines: [] });
+  if (url.endsWith("/revisions/revision/timelines")) return json([
+   { slug: "production", domains: [{ domain: "relay.org.deno.net" }] },
+  ]);
+  throw new Error(`Unexpected request: ${url}`);
+ };
+ const result = await deploy.deployDenoRelay(token, "relay");
+ assert.equal(result.url, "https://relay.org.deno.net");
+ assert.equal(deleted, false);
 });
 
 test("failed propagation probes retry and keep the authenticated deployment in the pool", async () => {
