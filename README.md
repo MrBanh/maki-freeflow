@@ -1,7 +1,16 @@
 # maki-freeflow
 
-Maki providers backed by the vendored pi-freeflow daemon (v1.34.0).
-Requires Node 22.19+ or Bun. The daemon starts on demand at `127.0.0.1:28180`.
+Maki providers backed by the [pi-freeflow](https://github.com/trefeon/pi-freeflow)
+daemon (v1.34.0, MIT © trefeon), vendored verbatim under `vendor/`. See
+[LICENSE](./LICENSE). Requires Node 22.19+ or Bun. The daemon starts on demand at `127.0.0.1:28180`.
+
+## Setup
+
+After cloning, install the daemon's runtime dependency:
+
+```
+cd vendor && npm ci --omit=dev
+```
 
 ## Deploy your own relay
 
