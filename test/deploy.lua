@@ -90,4 +90,26 @@ assert(written.relays[1].auth == nil)
 encoded.state = { relays = { { url = "https://relay.example", auth = "relay-secret" } } }
 command.dispatch("export --include-secrets")
 assert(written.relays[1].auth == "relay-secret")
+
+-- Informational popups must consume events and close explicitly.
+local daemon = package.loaded["freeflow.daemon"]
+daemon.ensure = function() return true end
+daemon.new_client_id = function() return "test-client" end
+daemon.get_health = function() return {} end
+daemon.get_models = function() return { data = {} } end
+daemon.vendor_version = function() return "test" end
+daemon.PORT = 28180
+local relay = package.loaded["freeflow.relay"]
+relay.read_state = function() return { mode = "auto", url = "https://relay.example", relays = { { url = "https://relay.example" } } } end
+relay.short_label = function() return "relay" end
+for _, sub in ipairs({ "status", "list", "models" }) do
+  for _, key in ipairs({ "<Esc>", "q", "<CR>" }) do
+    events = { { { type = "resize" }, { type = "key", key = "x" }, { type = "key", key = key } } }
+    command.dispatch(sub)
+    local win = windows[#windows]
+    assert(win.closed, sub .. " popup did not close on " .. key)
+    assert(#win.events == 0, sub .. " popup did not process its close key")
+    assert(win.opts.footer[1][2] == "close")
+  end
+end
 print("deploy Lua checks passed")

@@ -46,7 +46,18 @@ local function show_window(title, lines)
   for _, line in ipairs(lines) do
     buf:line(line)
   end
-  maki.ui.open_win(buf, { title = title, width = "70%", height = "60%" })
+  local win = maki.ui.open_win(buf, {
+    title = title, width = "70%", height = "60%",
+    footer = { { "Esc / q / Enter", "close" } },
+  })
+  -- Focused plugin windows receive keys through recv(); the host does not
+  -- supply a default dismissal handler for them.
+  while true do
+    local ev = win:recv()
+    if not ev or ev.type == "close" then break end
+    if ev.type == "key" and (ev.key == "<Esc>" or ev.key == "q" or ev.key == "<CR>") then break end
+  end
+  win:close()
 end
 
 local function split_first(args)
