@@ -53,8 +53,19 @@ function M.daemon_entry()
   return M.vendor_dir() .. "/src/daemon.ts"
 end
 
+-- Daemon root (control plane + node-shim paths below join onto this:
+-- /_health, /_client/*, /v1/models, /_shutdown).
 function M.base_url()
   return "http://" .. M.HOST .. ":" .. tostring(M.PORT)
+end
+
+-- Provider API origin for maki.provider.register. Maki's codecs append
+-- fixed paths to base_url ({base}/chat/completions for openai,
+-- {base}/responses for openai-responses), and the daemon only serves API
+-- routes under /v1/* — so this MUST carry the /v1 prefix. Registering the
+-- bare root 404s every chat and responses request with {"error":"not found"}.
+function M.api_base()
+  return M.base_url() .. "/v1"
 end
 
 -- Vendored package.json version (what /_health must report). Cached.

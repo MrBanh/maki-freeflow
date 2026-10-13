@@ -30,9 +30,9 @@ local function make_list_models(rows)
   local index = mapping.index_rows(rows)
   local fallback = mapping.static_list_rows(rows)
   return function(ctx)
-    -- ctx.get_json uses the provider origin + headers, so this follows a
-    -- user who repoints the slug at a gateway.
-    local body, err = ctx.get_json("/v1/models")
+    -- ctx.get_json appends the path to the provider origin (api_base, which
+    -- already ends in /v1), so this is "/models" and NOT "/v1/models".
+    local body, err = ctx.get_json("/models")
     if err then
       -- Daemon down: serve the static catalog so the picker is populated
       -- pre-daemon (mirrors pi's zero-latency static registration).
@@ -71,7 +71,9 @@ function M.setup(opts)
   end
 
   local port = daemon.PORT
-  local base_url = daemon.base_url()
+  -- api_base (not base_url): maki appends /chat/completions and /responses,
+  -- and the daemon only serves those under /v1/*.
+  local base_url = daemon.api_base()
 
   -- ── Provider 1: freeflow (chat completions) ─────────────────────
   maki.provider.register({

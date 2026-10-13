@@ -63,6 +63,11 @@ function M.map_daemon_models(body, index)
     local id = type(entry) == "table" and entry.id or entry
     if type(id) == "string" and id ~= "" then
       local row = index[id]
+      -- Strict per-provider catalog: daemon models with no row here are
+      -- SKIPPED, not listed bare. A bare listing would offer models from the
+      -- other provider (e.g. responses-only rows on the chat picker), whose
+      -- requests fail downstream (ModelProtocolUnsupported). New daemon
+      -- models appear here by transcribing them into the row files.
       if row then
         table.insert(out, {
           id = row.prefixes[1],
@@ -73,8 +78,6 @@ function M.map_daemon_models(body, index)
           supports_vision = row.supports_vision,
           tier = row.tier,
         })
-      else
-        table.insert(out, { id = id, tier = "medium" })
       end
     end
   end
