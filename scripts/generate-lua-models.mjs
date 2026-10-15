@@ -1,0 +1,259 @@
+// Regenerates lua/freeflow/models_chat.lua and lua/freeflow/models_responses.lua
+// from vendor/src/models.ts. Deterministic: re-running on an in-sync tree
+// produces byte-identical output.
+//
+//   node scripts/generate-lua-models.mjs         # rewrite both files
+//   node scripts/generate-lua-models.mjs --check # exit 1 if files differ
+//
+// Lane split: OPENCODE_MODELS with api == "openai-responses" go to the
+// responses file; everything else (including the Cline muse-spark, which the
+// daemon translates responses<->chat daemon-side) goes to the chat file.
+// Tiers are maki-side judgment: STRONG/WEAK below, medium default.
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const models = await import(join(root, "vendor/src/models.ts"));
+const pkg = JSON.parse(readFileSync(join(root, "vendor/package.json"), "utf8"));
+
+const { OPENCODE_MODELS, KILO_MODELS, CLINE_MODELS, OVH_MODELS, MODEL_ALIASES } = models;
+
+const CHECK = process.argv.includes("--check");
+
+// Canonical id -> sorted alias list.
+const aliasesOf = new Map();
+for (const [alias, canonical] of Object.entries(MODEL_ALIASES)) {
+  if (!aliasesOf.has(canonical)) aliasesOf.set(canonical, []);
+  aliasesOf.get(canonical).push(alias);
+}
+for (const list of aliasesOf.values()) list.sort();
+
+// Maki tier judgment (canonical ids). Everything else is medium.
+const STRONG = new Set([
+  "step-5-preview-free",
+  "dots-studio/dots-3-note-preview:free",
+  "deepseek-v4.1-flash-free",
+  "ovh-free/gpt-oss-120b",
+  "ovh-free/Qwen3.5-397B-A17B",
+  "muse-spark-1.3-contributor-free", // responses provider
+]);
+const WEAK = new Set([
+  "nemotron-3.5-lightning-free",
+  "liquid/lfm-2.5-2.6b:free",
+  "kilo-auto/free",
+  "openrouter/free",
+  "cohere/north-mini-code:free",
+  "poolside/laguna-xs-2.1:free",
+]);
+
+const LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+// Display name for tier comments: first slash-free alias, else canonical.
+function shortName(id) {
+  const als = (aliasesOf.get(id) || []).filter((a) => !a.includes("/"));
+  return als[0] || id;
+}
+
+function tierOf(id) {
+  if (STRONG.has(id)) return "strong";
+  if (WEAK.has(id)) return "weak";
+  return "medium";
+}
+
+// thinkingLevelMap -> Lua thinking_fields expression. Shared maps collapse
+// to helpers; anything else is emitted inline (fixed level order).
+function tfCall(lane, map) {
+  const entries = LEVELS.filter((l) => map[l] != null);
+  const sig = entries.map((l) => `${l}=${map[l]}`).join(",");
+  if (lane === "kilo" && sig === "minimal=minimal,low=low,medium=medium,high=high,xhigh=xhigh") return "kilo_tf()";
+  if (lane === "cline" && sig === "low=low,high=high,max=max") return "cline_flash_tf()";
+  if (lane === "ovh" && sig === "low=low,high=high") return "ovh_tf()";
+  return `tf({ ${entries.map((l) => `${l} = "${map[l]}"`).join(", ")} })`;
+}
+
+function rowOf(lane, m) {
+  const prefixes = [m.id, ...(aliasesOf.get(m.id) || [])];
+  const lines = [
+    "  {",
+    `    prefixes = { ${prefixes.map((p) => `"${p}"`).join(", ")} },`,
+    `    tier = "${tierOf(m.id)}",`,
+    `    context_window = ${m.contextWindow},`,
+    `    max_output_tokens = ${m.maxTokens},`,
+    `    supports_thinking = ${m.reasoning ? "true" : "false"},`,
+    `    supports_vision = ${(m.input || []).includes("image") || (m.input || []).includes("video") ? "true" : "false"},`,
+    "    pricing = ZERO,",
+  ];
+  if (m.reasoning) lines.push(`    thinking_fields = ${tfCall(lane, m.thinkingLevelMap || {})},`);
+  lines.push("  },");
+  return lines.join("\n");
+}
+
+const LANES = [
+  ["opencode", OPENCODE_MODELS.filter((m) => m.api !== "openai-responses")],
+  ["kilo", KILO_MODELS],
+  ["cline", CLINE_MODELS],
+  ["ovh", OVH_MODELS],
+];
+const SECTION = {
+  opencode: "OpenCode Zen chat models",
+  kilo: "Kilo Gateway models",
+  cline: "Cline direct-only models",
+  ovh: "OVHcloud AI Endpoints direct-only models (keyless, no relay)",
+};
+
+function tierNames(want) {
+  const out = [];
+  for (const [lane, list] of LANES) {
+    for (const m of list) {
+      if (tierOf(m.id) === want && m.api !== "openai-responses") out.push(shortName(m.id));
+    }
+  }
+  // Responses-provider strong model lives in the other file; name it too.
+  if (want === "strong") {
+    for (const m of OPENCODE_MODELS) {
+      if (m.api === "openai-responses" && tierOf(m.id) === want && !out.includes(shortName(m.id))) {
+        out.push(`${shortName(m.id)} (on the responses provider)`);
+      }
+    }
+  }
+  return out;
+}
+
+const chatCount = LANES.reduce((n, [, list]) => n + list.length, 0);
+const laneCount = Object.fromEntries(LANES.map(([lane, list]) => [lane, list.length]));
+
+const chatHeader = `-- freeflow model rows: ${chatCount} chat-completions models served through the
+-- vendored pi-freeflow daemon on 127.0.0.1:28180.
+--
+-- Generated by scripts/generate-lua-models.mjs from pi-freeflow src/models.ts
+-- (pinned version, see vendor/VENDORED.md) — do not hand-edit.
+--   ${laneCount.opencode} OpenCode Zen chat models + ${laneCount.kilo} Kilo Gateway models + ${laneCount.cline} Cline models + ${laneCount.ovh} OVH models.
+-- The ${OPENCODE_MODELS.filter((m) => m.api === "openai-responses").length} Zen muse-spark responses-API models live in models_responses.lua;
+-- cline-free/muse-spark-1.3-contributor rides HERE because the daemon
+-- translates responses<->chat for it daemon-side (works on either path).
+--
+-- Tier choices (pi has no tiers; maki needs one, default medium):
+--   strong: 1M-context flagships and big reasoning models
+--     ${tierNames("strong").join(", ")}
+--   weak: small/fast/router models
+--     ${tierNames("weak").join(", ")}
+--   medium: everything else.
+--
+-- thinking_fields: each valid effort level from the model's thinkingLevelMap
+-- maps to { reasoning_effort = <verbatim value> }. The daemon reads the flat
+-- reasoning_effort field and clamps unsupported levels per model
+-- (enforceOpencodeFingerprint/normalizeResponsesBody), so maki levels that
+-- snap onto an undeclared key are still safe downstream. \`off\` is omitted on
+-- every row: with thinking_fields declared, an omitted mode sends nothing.
+-- Pricing is 0/0 everywhere (free tiers).
+--
+-- Pure data: no \`maki\` references, loadable by plain lua for tests.
+
+-- Build { level = { reasoning_effort = value } }, skipping null (nil) levels.
+local function tf(levels)
+  local out = {}
+  for level, value in pairs(levels) do
+    if value ~= nil then
+      out[level] = { reasoning_effort = value }
+    end
+  end
+  return out
+end
+
+local ZERO = { input = 0, output = 0, cache_write = 0, cache_read = 0 }
+
+-- Shared Kilo reasoning map: minimal..xhigh verbatim, max unsupported.
+local function kilo_tf()
+  return tf({ minimal = "minimal", low = "low", medium = "medium", high = "high", xhigh = "xhigh" })
+end
+
+-- Narrow Cline flash map: low/high/max only.
+local function cline_flash_tf()
+  return tf({ low = "low", high = "high", max = "max" })
+end
+
+-- Narrow OVH reasoning map: low/high only (live-probed 2026-10-13).
+local function ovh_tf()
+  return tf({ low = "low", high = "high" })
+end
+
+local ROWS = {
+`;
+
+const respModels = OPENCODE_MODELS.filter((m) => m.api === "openai-responses");
+const respHeader = `-- freeflow-responses model rows: the ${respModels.length} OpenCode Zen muse-spark models
+-- whose upstream API is openai-responses and which HARD-require the
+-- /v1/responses path (proxy.ts warns on chat-path use; Kilo picks the
+-- responses URL by pathname ending in /responses).
+--
+-- Generated by scripts/generate-lua-models.mjs from pi-freeflow src/models.ts
+-- (pinned version, see vendor/VENDORED.md) — do not hand-edit.
+-- No thinking_fields here: effort rides via the build_body hook
+-- (opts.thinking -> body.reasoning.effort), which the daemon clamps
+-- per model in normalizeResponsesBody.
+--
+-- Pure data: no \`maki\` references, loadable by plain lua for tests.
+
+local ZERO = { input = 0, output = 0, cache_write = 0, cache_read = 0 }
+
+local ROWS = {
+`;
+
+function buildChat() {
+  let out = chatHeader;
+  for (const [lane, list] of LANES) {
+    if (!list.length) continue;
+    const bar = "─".repeat(38);
+    out += `-- ${bar} ${SECTION[lane]} ${bar}\n`;
+    for (const m of list) {
+      if (lane === "cline" && m.id === "cline-free/muse-spark-1.3-contributor") {
+        out += "  {\n    -- Cline muse-spark: responses-API upstream, but the daemon translates\n    -- responses<->chat daemon-side, so it rides the chat provider.\n";
+        out += rowOf(lane, m).split("\n").slice(1).join("\n") + "\n";
+      } else {
+        out += rowOf(lane, m) + "\n";
+      }
+    }
+  }
+  return out + "}\n\nreturn ROWS\n";
+}
+
+function buildResp() {
+  let out = respHeader;
+  for (const m of respModels) {
+    const prefixes = [m.id, ...(aliasesOf.get(m.id) || [])];
+    out += [
+      "  {",
+      `    prefixes = { ${prefixes.map((p) => `"${p}"`).join(", ")} },`,
+      `    tier = "${tierOf(m.id)}",`,
+      `    context_window = ${m.contextWindow},`,
+      `    max_output_tokens = ${m.maxTokens},`,
+      `    supports_thinking = ${m.reasoning ? "true" : "false"},`,
+      `    supports_vision = ${(m.input || []).includes("image") || (m.input || []).includes("video") ? "true" : "false"},`,
+      "    pricing = ZERO,",
+      "  },",
+    ].join("\n") + "\n";
+  }
+  return out + "}\n\nreturn ROWS\n";
+}
+const outputs = new Map([
+  [join(root, "lua/freeflow/models_chat.lua"), buildChat()],
+  [join(root, "lua/freeflow/models_responses.lua"), buildResp()],
+]);
+
+let dirty = false;
+for (const [path, want] of outputs) {
+  const have = readFileSync(path, "utf8");
+  if (have !== want) {
+    dirty = true;
+    if (CHECK) {
+      console.error(`OUT OF SYNC: ${path} (run scripts/generate-lua-models.mjs)`);
+    } else {
+      writeFileSync(path, want);
+      console.log(`wrote ${path}`);
+    }
+  }
+}
+if (CHECK && dirty) process.exit(1);
+if (!CHECK && !dirty) console.log("already in sync");
+console.log(`source: pi-freeflow ${pkg.version}`);

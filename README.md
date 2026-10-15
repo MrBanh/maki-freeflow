@@ -99,9 +99,11 @@ The command layer still reports unsupported host-specific upstream commands
 
 ```
 node --experimental-strip-types --test test/deploy.test.mjs
+node --test test/setup.test.mjs test/cline.test.mjs test/models.test.mjs
 lua test/deploy.lua
 lua test/setup.lua
-node --test test/setup.test.mjs
+lua test/cline.lua
+lua test/mapping.lua
 ```
 
 Tests mock platform APIs and use an isolated state directory; no cloud

@@ -93,14 +93,14 @@ stay cut on Maki (see `command.lua` CUT — a vendored copy never self-updates).
 
 ## How to re-sync
 
-1. `git clone --depth 1 https://github.com/trefeon/pi-freeflow.git /tmp/pi-freeflow-upstream`
-2. `diff -rq /tmp/pi-freeflow-upstream/src vendor/src` — review.
-3. Copy `src/`, `package.json` (keep `maki-*` shims; bump the two
-   `1.x` version fields in `package-lock.json` to match).
-4. Re-apply (or drop, if upstreamed) the "Local patches" above.
-5. Re-transcribe `lua/freeflow/models_*.lua` from the new `src/models.ts`
-   (counts, aliases, context/max-output, vision, thinking maps).
-6. Update this file's "Currently aligned with" section + HEAD SHA,
-   then run `node --test test/setup.test.mjs`,
-   `node --experimental-strip-types --test test/deploy.test.mjs`,
-   `lua test/deploy.lua`, `lua test/setup.lua`.
+Follow `SYNC.md` at repo root (procedure, generator, verification).
+Notes specific to this pin:
+
+- Lua rows are generated, not transcribed:
+  `node scripts/generate-lua-models.mjs` reads `vendor/src/models.ts`
+  (tiers: `STRONG`/`WEAK` sets in the script, medium default).
+- `test/models.test.mjs` fails if committed rows drift from the script.
+- Unknown `owned_by == "opencode"` daemon ids pass through
+  (`mapping.passthrough_row`) with conservative defaults, so OpenCode-lane
+  churn needs no sync; other lanes stay hidden until transcribed.
+- Kept local patch: `vendor/src/deploy.ts` Deno hostnames (see above).

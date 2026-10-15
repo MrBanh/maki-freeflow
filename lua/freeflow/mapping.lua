@@ -54,8 +54,12 @@ end
 
 -- Map a daemon GET /v1/models body ({ object="list", data={ {id,...} } })
 -- onto list_models rows using the static index for limits/tier/flags.
--- Daemon ids with no static row pass through as bare medium-tier rows so a
--- newer daemon catalog is never hidden by an older plugin copy.
+-- Daemon ids with no static row are SKIPPED, except OpenCode-lane ids
+-- (owned_by == "opencode"), which pass through as conservative bare rows
+-- so models the daemon learned via live background refresh work with no
+-- repo sync. Other lanes stay hidden: the daemon routes Kilo/Cline/OVH by
+-- static id sets, so those would misroute to the OpenCode lane and fail.
+-- A later sync transcribes proper specs and the static row wins by index hit.
 function M.map_daemon_models(body, index)
   local out = {}
   local data = (type(body) == "table" and body.data) or {}
@@ -78,10 +82,28 @@ function M.map_daemon_models(body, index)
           supports_vision = row.supports_vision,
           tier = row.tier,
         })
+      elseif type(entry) == "table" and entry.owned_by == "opencode" then
+        table.insert(out, M.passthrough_row(id))
       end
     end
   end
   return out
+end
+
+-- Conservative bare row for a daemon-known id with no static row.
+-- Understated on purpose: worst case is early compaction or a blocked
+-- image send, never a broken request. No thinking_fields means maki
+-- sends no effort level and the daemon default applies.
+function M.passthrough_row(id)
+  return {
+    id = id,
+    context_window = 262144,
+    max_output_tokens = 32768,
+    pricing = { input = 0, output = 0, cache_write = 0, cache_read = 0 },
+    supports_thinking = false,
+    supports_vision = false,
+    tier = "medium",
+  }
 end
 
 -- Static rows -> list_models fallback rows (used when the daemon is
