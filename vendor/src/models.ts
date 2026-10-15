@@ -11,7 +11,7 @@ import type { ModelDef, ThinkingLevelMap, Upstream } from "./types.ts";
 
 /**
  * OpenCode Zen free models verified against the live catalog and inference APIs.
- * Endpoint: https://opencode.ai/zen/v1
+ * Endpoint: https://opencode.ai/inference/v1
  */
 export const OPENCODE_MODELS: ModelDef[] = [
  {

@@ -1,4 +1,4 @@
-import { opencodeHeaders } from "./config.ts";
+import { OPENCODE_API_URL, opencodeHeaders } from "./config.ts";
 import { ensureChatFingerprintTools } from "./opencode-fingerprint.ts";
 
 /**
@@ -17,7 +17,7 @@ export interface RelayProbeOptions {
  /**
   * Probe mode:
   * - "models" (default): GET /v1/models (reachability probe)
-  * - "chat": POST /zen/v1/chat/completions (verifies free tier inference & spoofing)
+  * - "chat": POST /inference/v1/chat/completions (verifies free tier inference & spoofing)
   */
  endpoint?: "models" | "chat";
  /** Model to use for chat probe (defaults to "nemotron-3.5-lightning-free") */
@@ -45,7 +45,7 @@ export interface RelayProbeOptions {
  *
  * The path mirrors the proxy's real relay contract (`relayFetch` in relay.ts):
  * `x-relay-target` is the upstream origin and `x-relay-path` the full path
- * including the `/zen` prefix — the workers only allow the exact origins
+ * including the `/inference` prefix — the workers only allow the exact origins
  * `https://opencode.ai` / `https://api.kilo.ai` and forward `target + path`.
  * @param auth Optional per-relay shared secret; sent as x-relay-auth so
  *   deployed relays (which enforce it) answer the probe instead of 401.
@@ -76,7 +76,7 @@ async function probeRelayOnce(
 
   if (isDirectOpenCode) {
    if (isChat) {
-    fetchUrl = "https://opencode.ai/zen/v1/chat/completions";
+    fetchUrl = `${OPENCODE_API_URL}/chat/completions`;
     method = "POST";
     headers["content-type"] = "application/json";
     const probePayload: Record<string, unknown> = {
@@ -88,15 +88,15 @@ async function probeRelayOnce(
     ensureChatFingerprintTools(probePayload);
     body = JSON.stringify(probePayload);
    } else {
-    fetchUrl = "https://opencode.ai/zen/v1/models";
+    fetchUrl = `${OPENCODE_API_URL}/models`;
    }
   } else {
    if (isChat) {
-    fetchUrl = `${cleanUrl}/zen/v1/chat/completions`;
+    fetchUrl = `${cleanUrl}/inference/v1/chat/completions`;
     method = "POST";
     headers["content-type"] = "application/json";
     headers["x-relay-target"] = "https://opencode.ai";
-    headers["x-relay-path"] = "/zen/v1/chat/completions";
+    headers["x-relay-path"] = "/inference/v1/chat/completions";
     const probePayload: Record<string, unknown> = {
      model: opts?.model || "nemotron-3.5-lightning-free",
      max_tokens: 1,
@@ -108,7 +108,7 @@ async function probeRelayOnce(
    } else {
     fetchUrl = `${cleanUrl}/v1/models`;
     headers["x-relay-target"] = "https://opencode.ai";
-    headers["x-relay-path"] = "/zen/v1/models";
+    headers["x-relay-path"] = "/inference/v1/models";
    }
   }
 

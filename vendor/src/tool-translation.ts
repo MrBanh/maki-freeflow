@@ -175,6 +175,39 @@ export const OMP_FINGERPRINT_DEFS: Record<Exclude<FingerprintToolName, "edit">, 
  },
 };
 
+/** Minimal valid schemas for injected compat tools to satisfy upstream inference gate. */
+export const COMPAT_FINGERPRINT_SCHEMAS: Record<FingerprintToolName, Record<string, unknown>> = {
+ bash: {
+  type: "object",
+  properties: { command: { type: "string", description: "Shell command to run." } },
+  required: ["command"],
+ },
+ read: {
+  type: "object",
+  properties: { path: { type: "string", description: "File path to read." } },
+  required: ["path"],
+ },
+ glob: {
+  type: "object",
+  properties: { path: { type: "string", description: "Search path." } },
+ },
+ grep: {
+  type: "object",
+  properties: { pattern: { type: "string", description: "Search pattern." } },
+  required: ["pattern"],
+ },
+ edit: {
+  type: "object",
+  properties: { path: { type: "string", description: "File path to edit." } },
+  required: ["path"],
+ },
+ write: {
+  type: "object",
+  properties: { path: { type: "string", description: "File path to write." } },
+  required: ["path"],
+ },
+};
+
 /** Caller tool names that only an OMP host sends (never Pi). */
 export const OMP_CALLER_MARKERS = ["ask", "task", "todo", "hub", "lsp"] as const;
 

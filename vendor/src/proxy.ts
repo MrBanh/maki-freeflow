@@ -506,6 +506,10 @@ export function sanitizeHeaders(
  // duplicate (case-differing) User-Agent pair — upstream resets connections
  // that send two conflicting User-Agent headers.
  delete sanitized["user-agent"];
+ // Upstream /inference/v1 treats x-opencode-request: msg_* as a non-OpenCode
+ // client signal (403 FreeTierError). Never forward a caller-supplied value;
+ // opencodeHeaders() no longer emits it.
+ delete sanitized["x-opencode-request"];
  Object.assign(sanitized, opencodeHeaders());
  sanitized["accept-encoding"] = "identity";
  sanitized.connection = "keep-alive";

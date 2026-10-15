@@ -50,7 +50,7 @@ test("all platform deployers register private relays, preserve labels, and probe
     if (url.startsWith(`https://${host}/`)) {
      assert.equal(init.headers["x-relay-auth"], embeddedAuth);
      assert.equal(init.headers["x-relay-target"], "https://opencode.ai");
-     assert.equal(init.headers["x-relay-path"], "/zen/v1/models");
+     assert.equal(init.headers["x-relay-path"], "/inference/v1/models");
      return json({ data: [] });
     }
     assert.equal(init.headers.Authorization, `Bearer ${token}`);
@@ -189,7 +189,7 @@ test("worker auth and guarded forwarding operate in every platform wrapper", asy
   // Extract the canonical core before the platform entry point.
   const core = source.split(/\nexport |\nDeno\.serve/)[0];
   const handler = new Function("fetch", `${core}; return relayHandler;`)(async (url, init) => {
-   assert.equal(url, "https://opencode.ai/zen/v1/models");
+   assert.equal(url, "https://opencode.ai/inference/v1/models");
    assert.equal(init.headers.get("x-relay-auth"), null);
    assert.equal(init.headers.get("x-relay-target"), null);
    return new Response("streamed response");
@@ -199,8 +199,8 @@ test("worker auth and guarded forwarding operate in every platform wrapper", asy
   });
   assert.equal((await handler(request("https://opencode.ai", "/", "wrong"))).status, 401);
   assert.equal((await handler(request("https://127.0.0.1", "/"))).status, 403);
-  assert.equal((await handler(request("https://opencode.ai", "//evil.example/path"))).status, 403);
-  assert.equal(await (await handler(request("https://opencode.ai", "/zen/v1/models"))).text(), "streamed response");
+   assert.equal((await handler(request("https://opencode.ai", "//evil.example/path"))).status, 403);
+   assert.equal(await (await handler(request("https://opencode.ai", "/inference/v1/models"))).text(), "streamed response");
  }
 });
 

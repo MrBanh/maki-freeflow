@@ -1,8 +1,8 @@
 /**
  * OpenCode Zen free-tier client fingerprint enforcement & SSE stream aggregator.
  *
- * Upstream OpenCode Zen (/zen/v1/chat/completions, /zen/v1/responses and
- * /zen/v1/messages) validates requests against the official OpenCode agentic
+ * Upstream OpenCode Zen (/inference/v1/chat/completions, /inference/v1/responses and
+ * /inference/v1/messages) validates requests against the official OpenCode agentic
  * client fingerprint. If any of the following 4 axes are missing, upstream
  * answers HTTP 403 FreeTierError:
  * 1. User-Agent (opencode/1.18.31, >= 1.17.0)
@@ -26,6 +26,7 @@
  * per-request map (never module-global).
  */
 import {
+ COMPAT_FINGERPRINT_SCHEMAS,
  COMPAT_TOOL_DESCRIPTION,
  OMP_FINGERPRINT_DEFS,
  OPENCODE_FINGERPRINT_TOOLS,
@@ -104,7 +105,7 @@ export function isPlaceholderToolName(name: unknown): boolean {
  * functions below.
  */
 function fingerprintFill(name: FingerprintToolName, omp: boolean): { description: string; schema: Record<string, unknown> } {
- if (!omp || name === "edit") return { description: COMPAT_TOOL_DESCRIPTION, schema: { type: "object", properties: {} } };
+ if (!omp || name === "edit") return { description: COMPAT_TOOL_DESCRIPTION, schema: COMPAT_FINGERPRINT_SCHEMAS[name] };
  const def = OMP_FINGERPRINT_DEFS[name];
  return { description: def.description, schema: { ...(def.parameters as Record<string, unknown>) } };
 }

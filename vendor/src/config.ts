@@ -2,7 +2,7 @@
  * Configuration and path resolution for pi-freeflow
  */
 
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,7 +21,7 @@ try {
 export { PKG_VERSION };
 
 // ── Upstream endpoints ──────────────────────────────────────────────
-export const UPSTREAM_OPENCODE = "https://opencode.ai/zen";
+export const UPSTREAM_OPENCODE = "https://opencode.ai/inference";
 export const KILO_CHAT_URL = "https://api.kilo.ai/api/gateway/chat/completions";
 export const KILO_RESPONSES_URL = "https://api.kilo.ai/api/gateway/responses";
 export const OPENCODE_API_URL = `${UPSTREAM_OPENCODE}/v1`;
@@ -239,14 +239,19 @@ export const OPENCODE_SESSION = createOpenCodeSessionId();
 
 export function opencodeHeaders(): Record<string, string> {
  const sessionId = OPENCODE_SESSION;
+ // Real OpenCode CLI (captured 2.0.28) does NOT send x-opencode-request on
+ // /inference/v1. Emitting msg_* there is treated as a non-OpenCode client and
+ // returns 403 FreeTierError — keep the helper for ID-shape tests, but omit
+ // the header on the wire.
  return {
+  Authorization: "Bearer public",
   "User-Agent": getOpenCodeUserAgent(),
   "x-opencode-client": OPENCODE_CLIENT,
   "x-opencode-project": OPENCODE_PROJECT,
   "x-opencode-session": sessionId,
   "x-opencode-session-id": sessionId,
   "x-session-affinity": sessionId,
-  "x-opencode-request": createOpenCodeRequestId(),
+  "x-session-id": sessionId,
  };
 }
 
