@@ -17,7 +17,7 @@ export interface RelayProbeOptions {
  /**
   * Probe mode:
   * - "models" (default): GET /v1/models (reachability probe)
-  * - "chat": POST /inference/v1/chat/completions (verifies free tier inference & spoofing)
+ * - "chat": POST /inference/v1/chat/completions (verifies free tier inference & spoofing)
   */
  endpoint?: "models" | "chat";
  /** Model to use for chat probe (defaults to "nemotron-3.5-lightning-free") */
@@ -45,7 +45,7 @@ export interface RelayProbeOptions {
  *
  * The path mirrors the proxy's real relay contract (`relayFetch` in relay.ts):
  * `x-relay-target` is the upstream origin and `x-relay-path` the full path
- * including the `/inference` prefix — the workers only allow the exact origins
+ * including the `/zen` prefix — the workers only allow the exact origins
  * `https://opencode.ai` / `https://api.kilo.ai` and forward `target + path`.
  * @param auth Optional per-relay shared secret; sent as x-relay-auth so
  *   deployed relays (which enforce it) answer the probe instead of 401.

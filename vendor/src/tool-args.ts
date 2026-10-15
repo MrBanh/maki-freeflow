@@ -9,8 +9,11 @@
  * `items: { item: [...] }`. Sibling free models invented whole vocabularies
  * (`phases` / `name` / `tasks`) the schema never declared.
  *
- * Two families are mechanically decidable from the CALLER's own declared
+ * Three families are mechanically decidable from the CALLER's own declared
  * schema, and this module repairs exactly those:
+ *
+ * - Prefix-glue salvage: an argument string carrying the tail of the previous
+ *   call in front of the caller's own object is recovered (see parseArguments).
  *
  * - Envelope unwrap: a declared array that arrives wrapped in a single-key
  *   object (`items: { item: [...] }`) is unwrapped.
@@ -38,6 +41,14 @@ import { canonicalizeTool } from "./tool-translation.ts";
 /** Bound on recursive repair/validation; real host schemas nest 3-4 deep. */
 const MAX_DEPTH = 8;
 
+/**
+ * Text ending in a bare numeric literal (`"timeout":18`, `"n":1.`, `"n":1e`).
+ * A complete JSON value is never followed by a digit, so this can only be a
+ * literal the model was still writing when the stream cut — see
+ * {@link appendClosers}.
+ */
+const CUT_NUMBER_TAIL = /[\d.eE+-]$/;
+
 /** Declared JSON Schema type, tolerating union types like ["array","null"]. */
 function schemaType(schema: Record<string, unknown>): string {
   const declared = schema.type;
@@ -49,10 +60,47 @@ function schemaType(schema: Record<string, unknown>): string {
   return "";
 }
 
-/** A schema property worth repairing: it holds an object or an array. */
-function structuralProperty(schema: Record<string, unknown>): boolean {
-  const type = schemaType(schema);
-  return type === "object" || type === "array";
+
+/**
+ * Does a value already satisfy the declared schema? Type, then required keys,
+ * then each present property recursively. A present property the schema does
+ * not declare is ignored (never fails): hosts decide their own extras policy,
+ * and this only gates whether a promotion is safe.
+ *
+ * Deliberately reads five keywords — `type`, `enum`, `properties`, `items`,
+ * `required` — and nothing else. `minItems`, `minLength`, `pattern`,
+ * `additionalProperties` and `strict` are NOT enforced, on purpose: this
+ * function only decides whether to hand the repaired value to the host, and
+ * the host validates the same keywords itself. A payload that violates
+ * `minItems` is rejected by the host whether or not the repair accepted it, so
+ * enforcing it here could only ever DISABLE a repair that would have been
+ * accepted downstream — strictly worse, never better. The trade-off this does
+ * leave: repair never rescues a call whose only fault is a constraint like
+ * `minItems`, because the shape was never the problem.
+ */
+/**
+ * Is this property allowed to be absent?
+ *
+ * Both hosts rewrite a tool's schema for strict mode by listing EVERY property
+ * key in `required` and wrapping each optional one in
+ * `anyOf: [<schema>, { type: "null" }]` (OMP: packages/ai CONSTRAINTS.md:34-49;
+ * Pi: core/constrained-sampling.ts:118-123). So "required" there does not mean
+ * "must be present" — it means "must be addressable". Reading it literally made
+ * this gate refuse every well-formed call on a strict tool, which silently
+ * disabled the whole repair for `bash` and the strict edit modes: the glued
+ * payload the host rejects is exactly the one this module exists to fix.
+ */
+function isNullableProperty(prop: unknown): boolean {
+	if (prop === null || typeof prop !== "object" || Array.isArray(prop)) return false;
+	const rec = prop as Record<string, unknown>;
+	if (Array.isArray(rec.type)) return (rec.type as unknown[]).includes("null");
+	const anyOf = rec.anyOf;
+	if (Array.isArray(anyOf)) {
+	for (const branch of anyOf) {
+		if (branch !== null && typeof branch === "object" && !Array.isArray(branch) && (branch as Record<string, unknown>).type === "null") return true;
+	}
+	}
+	return false;
 }
 
 /**
@@ -60,38 +108,74 @@ function structuralProperty(schema: Record<string, unknown>): boolean {
  * then each present property recursively. A present property the schema does
  * not declare is ignored (never fails): hosts decide their own extras policy,
  * and this only gates whether a promotion is safe.
+ *
+ * Deliberately reads `type`, `enum`, `properties`, `items`, `required` — and
+ * nothing else. `minItems`, `minLength`, `pattern`, `additionalProperties` and
+ * `strict` are NOT enforced, on purpose: this function only decides whether to
+ * hand the repaired value to the host, and the host validates the same
+ * keywords itself. A payload that violates `minItems` is rejected by the host
+ * whether or not the repair accepted it, so enforcing it here could only ever
+ * DISABLE a repair the host would otherwise have accepted — strictly worse,
+ * never better. The trade-off this leaves: repair never rescues a call whose
+ * only fault is a constraint like `minItems`, because the shape was never the
+ * problem.
  */
 function matchesSchema(value: unknown, schema: Record<string, unknown>, depth: number): boolean {
-  if (depth > MAX_DEPTH) return false;
-  const type = schemaType(schema);
-  if (type === "array") {
-   if (!Array.isArray(value)) return false;
-   const items = schema.items;
-   if (items === null || typeof items !== "object" || Array.isArray(items)) return true;
-   return value.every((element) => matchesSchema(element, items as Record<string, unknown>, depth + 1));
-  }
-  if (type === "object") {
-   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-   const rec = value as Record<string, unknown>;
-   if (Array.isArray(schema.required)) {
-    for (const key of schema.required) {
-     if (typeof key === "string" && !(key in rec)) return false;
-    }
+ if (depth > MAX_DEPTH) return false;
+ const type = schemaType(schema);
+ if (type === "array") {
+  if (!Array.isArray(value)) return false;
+  const items = schema.items;
+  if (items === null || typeof items !== "object" || Array.isArray(items)) return true;
+  return value.every((element) => matchesSchema(element, items as Record<string, unknown>, depth + 1));
+ }
+ if (type === "object") {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const rec = value as Record<string, unknown>;
+  const props = schema.properties;
+  const declared = props !== null && typeof props === "object" && !Array.isArray(props) ? (props as Record<string, unknown>) : null;
+  if (Array.isArray(schema.required)) {
+   for (const key of schema.required) {
+    if (typeof key !== "string" || key in rec) continue;
+    // Strict-mode hosts list every key here and mark the optional ones nullable,
+    // so a nullable key that is absent is correct, not a violation.
+    if (declared !== null && isNullableProperty(declared[key])) continue;
+    return false;
    }
-   const props = schema.properties;
-   if (props === null || typeof props !== "object" || Array.isArray(props)) return true;
-   for (const [key, entry] of Object.entries(rec)) {
-    const propSchema = (props as Record<string, unknown>)[key];
-    if (propSchema === null || typeof propSchema !== "object" || Array.isArray(propSchema)) continue;
-    if (!matchesSchema(entry, propSchema as Record<string, unknown>, depth + 1)) return false;
-   }
-   return true;
   }
-  if (type === "string") return typeof value === "string";
-  if (type === "number") return typeof value === "number" && Number.isFinite(value);
-  if (type === "boolean") return typeof value === "boolean";
-  if (Array.isArray(schema.enum)) return schema.enum.some((member) => member === value);
+  if (declared === null) return true;
+  for (const [key, entry] of Object.entries(rec)) {
+   const propSchema = declared[key];
+   if (propSchema === null || typeof propSchema !== "object" || Array.isArray(propSchema)) continue;
+   if (!matchesSchema(entry, propSchema as Record<string, unknown>, depth + 1)) return false;
+  }
   return true;
+ }
+ if (type === "string") return typeof value === "string";
+ if (type === "number") return typeof value === "number" && Number.isFinite(value);
+ if (type === "boolean") return typeof value === "boolean";
+ if (Array.isArray(schema.enum)) return schema.enum.some((member) => member === value);
+ return true;
+}
+
+/** The spellings free models use for "no value" when the slot is nullable. */
+const NULL_SENTINELS = new Set(["null", "none", "undefined", "nil", "n/a"]);
+
+function isNullSentinel(text: string): boolean {
+	return NULL_SENTINELS.has(text.trim().toLowerCase());
+}
+
+/** The non-null branch of a nullable declaration, or null when it is not one. */
+function nonNullBranch(prop: Record<string, unknown>): Record<string, unknown> | null {
+	const anyOf = prop.anyOf;
+	if (!Array.isArray(anyOf)) return null;
+	for (const branch of anyOf) {
+		if (branch === null || typeof branch !== "object" || Array.isArray(branch)) continue;
+		const rec = branch as Record<string, unknown>;
+		if (rec.type === "null") continue;
+		return rec;
+	}
+	return null;
 }
 
 /**
@@ -163,6 +247,24 @@ function repairValue(
    if (propSchema === null || typeof propSchema !== "object" || Array.isArray(propSchema)) {
     out[key] = entry;
     continue;
+   }
+   // A strict host makes optional keys `anyOf: [T, null]`, and free models
+   // routinely answer that slot with the SENTINEL AS TEXT — `"timeout":"null"`,
+   // `"pty":"None"` (measured across 4 of 37 catalog models). The host rejects
+   // the call because a string is not a number and not null.
+   //
+   // Restricted to non-string inner types on purpose: when T is `string`,
+   // `"null"` could be a genuine value and rewriting it would destroy data.
+   // With T = number/boolean/object/array the property can never legitimately
+   // hold a bare string, so collapsing a null sentinel loses nothing and makes
+   // the call one the host accepts.
+   if (typeof entry === "string" && isNullSentinel(entry)) {
+    const nonNull = nonNullBranch(propSchema as Record<string, unknown>);
+    if (nonNull !== null && schemaType(nonNull) !== "string") {
+     out[key] = null;
+     changed = true;
+     continue;
+    }
    }
    const repaired = repairValue(entry, propSchema as Record<string, unknown>, depth + 1);
    if (repaired.changed) changed = true;
@@ -318,28 +420,29 @@ function promoteStringArray(
 
 /**
  * Per-request map of caller tool name (lowercased) to the schema its
- * arguments are repaired against. Only tools whose parameters declare at least
- * one object or array property are kept: those are the only ones a repair can
- * act on, and an empty map means the request streams byte-identically.
+ * arguments are repaired against. Every tool that declares object parameters
+ * is kept, NOT only those with an object/array property: the prefix-glue
+ * salvage in {@link parseArguments} needs only the caller's own schema to
+ * confirm the recovered object, and it fires most often on scalar-only tools.
+ * `bash` is the live case — OMP's `bashSchemaBase` declares only `command`,
+ * `timeout`, `cwd`, `pty` (reference/oh-my-pi tools/bash.ts:327), so a
+ * structural-only filter left the most-used tool unrepairable and the host
+ * rejected the glued payload outright.
  *
  * Keyed by CALLER name, which is what arrives downstream after the casing and
  * find->glob restores. Injected fingerprint placeholders are absent by
  * construction, so they are never repaired.
  */
 export function buildArgRepairSchemas(tools: unknown[]): Map<string, Record<string, unknown>> {
-  const schemas = new Map<string, Record<string, unknown>>();
-  for (const tool of tools) {
-   const canon = canonicalizeTool(tool);
-   if (canon === null) continue;
-   const props = canon.parameters.properties;
-   if (props === null || typeof props !== "object" || Array.isArray(props)) continue;
-   const hasStructural = Object.values(props as Record<string, unknown>).some(
-    (prop) => prop !== null && typeof prop === "object" && !Array.isArray(prop) && structuralProperty(prop as Record<string, unknown>),
-   );
-   if (!hasStructural) continue;
-   schemas.set(canon.name.trim().toLowerCase(), canon.parameters);
-  }
-  return schemas;
+ const schemas = new Map<string, Record<string, unknown>>();
+ for (const tool of tools) {
+  const canon = canonicalizeTool(tool);
+  if (canon === null) continue;
+  const props = canon.parameters.properties;
+  if (props === null || typeof props !== "object" || Array.isArray(props)) continue;
+  schemas.set(canon.name.trim().toLowerCase(), canon.parameters);
+ }
+ return schemas;
 }
 
 
@@ -357,8 +460,12 @@ export function buildArgRepairSchemas(tools: unknown[]): Map<string, Record<stri
  *
  * Both are one complete JSON object with junk in front of it. Only strings that
  * do not parse as-is are considered, and only a position that yields a complete
- * object is accepted, so a well-formed call never reaches this path and a
- * truncated one is still refused rather than completed.
+ * object is accepted, so a well-formed call never reaches this path.
+ *
+ * A second live shape (2026-10-13) carried BOTH faults at once — the previous
+ * call's tail in front AND the closing brace missing — so the scan also offers
+ * the candidate with its closers appended. That offer is made only at the first
+ * brace and only when a fragment precedes it; see appendClosers.
  *
  * Returns undefined when nothing salvageable is present.
  */
@@ -370,17 +477,105 @@ function parseArguments(argsJson: string): { value: Record<string, unknown>; sal
   } catch {
     // fall through to the salvage scan
   }
-  for (let i = argsJson.indexOf("{"); i !== -1; i = argsJson.indexOf("{", i + 1)) {
-    try {
-      const value = JSON.parse(argsJson.slice(i));
-      if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-        return { value: value as Record<string, unknown>, salvaged: true };
-      }
-    } catch {
-      // not a start position; try the next brace
+ // Only a brace that OPENS a top-level object can start the caller's call: a
+ // brace nested inside an already-unterminated object belongs to that outer
+ // object, so promoting it would drop the declared key that wraps it
+ // (`{"opts":{"a":1` must not salvage to `{"a":1}`).
+ for (const start of topLevelObjectStarts(argsJson)) {
+  const candidate = argsJson.slice(start);
+  const i = start;
+  // Two shapes to try, in order: the candidate as written, then the candidate
+  // with its missing closers appended. The closer is only offered at the FIRST
+  // brace and only when something precedes it — that fragment is the evidence
+  // the model was mid-call and lost the tail. A bare `{"op":"init"` stays
+  // refused, and so does an inner `{"phase":…` inside an already-truncated
+  // object, which is why this is not offered at every brace.
+  const candidates = i === 0 ? [candidate] : [candidate, appendClosers(candidate)];
+  for (const attempt of candidates) {
+   if (attempt === undefined) continue;
+   try {
+    const value = JSON.parse(attempt);
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+     return { value: value as Record<string, unknown>, salvaged: true };
     }
+   } catch {
+    // not a start position; try the next brace
+   }
   }
-  return undefined;
+ }
+ return undefined;
+}
+
+/**
+ * Offsets of every `{` that could open the caller's own object.
+ *
+ * Depth counts braces only, clamped at zero, and deliberately ignores string
+ * state. The junk in front is itself a cut fragment: it usually ends
+ * mid-string (`…/freelane-proxy"`), so string tracking would classify the whole
+ * real call as "inside a string" and find no start at all — which is exactly
+ * the live failure this scan has to recover from.
+ *
+ * A nested brace is a candidate only when no key precedes it: `{"opts":{"a":1}`
+ * must NOT promote its inner `{"a":1}` (a `:` sits between, so the outer
+ * object is a real one and its declared key would be dropped), while the
+ * observed prefix junk `}{` must still reach the real call that follows it.
+ */
+function topLevelObjectStarts(text: string): number[] {
+ const starts: number[] = [];
+ const openAt: number[] = [];
+ for (let i = 0; i < text.length; i++) {
+  if (text[i] === "{") {
+   if (openAt.length === 0 || !text.slice(openAt[openAt.length - 1] + 1, i).includes(":")) starts.push(i);
+   openAt.push(i);
+   continue;
+  }
+  if (text[i] === "}" && openAt.length > 0) openAt.pop();
+ }
+ return starts;
+}
+
+/**
+ * Append the closers an unterminated JSON object is missing, or undefined when
+ * that would mean guessing.
+ *
+ * Only ever called on a candidate that starts at a `{` preceded by a fragment
+ * of the previous call, and only when the candidate's own contents already
+ * end cleanly. Three refusals keep this honest:
+ *
+ * - Cut inside a string literal (an unterminated `"`) returns undefined. The
+ *   value itself is incomplete, so any closing brace would silently shorten
+ *   it — and these arguments carry shell commands.
+ * - Cut inside a number literal returns undefined. `{"timeout":18` may have
+ *   been `180`, `18.5`, or `18`; completing it hands the host a confident wrong
+ *   value with nothing to signal the guess. (`timeout` is a declared number on
+ *   both hosts' `bash`.)
+ * - Nothing left open returns undefined, so a well-formed candidate never
+ *   reaches this path.
+ *
+ * Appending a closer never adds or removes a value, so a caller whose payload
+ * parsed to a complete object here is getting back exactly what the model
+ * emitted, minus the previous call's echo.
+ */
+function appendClosers(text: string): string | undefined {
+ const open: string[] = [];
+ let inString = false;
+ let escaped = false;
+ for (const ch of text) {
+  if (inString) {
+   if (escaped) escaped = false;
+   else if (ch === "\\") escaped = true;
+   else if (ch === '"') inString = false;
+   continue;
+  }
+  if (ch === '"') inString = true;
+  else if (ch === "{" || ch === "[") open.push(ch === "{" ? "}" : "]");
+  else if (ch === "}" || ch === "]") open.pop();
+ }
+ // Inside a string at the end: the value was cut mid-token, so refuse.
+ if (inString || open.length === 0) return undefined;
+ // A bare number at the end is a cut literal (`18` of `180`), so refuse.
+ if (CUT_NUMBER_TAIL.test(text)) return undefined;
+ return text + open.reverse().join("");
 }
 /**
  * Repair one tool call's arguments against its declared schema. `name` is the

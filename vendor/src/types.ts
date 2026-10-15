@@ -3,7 +3,7 @@
  */
 
 export type ProviderApi = "openai-completions" | "openai-responses" | "anthropic-messages";
-export type Upstream = "opencode" | "kilo" | "cline";
+export type Upstream = "opencode" | "kilo" | "cline" | "ovh";
 
 export type ThinkingLevel =
  | "off"
@@ -48,7 +48,8 @@ export interface RelayState {
  enabled: boolean;
  url: string;
  relays: KnownRelay[];
- hideWidget?: boolean;
+	hideWidget?: boolean;
+	autoUpdate?: boolean;
 }
 export type LogLevel = "debug" | "info" | "warn" | "error" | "audit";
 

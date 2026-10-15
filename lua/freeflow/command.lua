@@ -20,6 +20,7 @@ local CUT = {
   log = "logs are cut — read the daemon log file directly (see /freeflow status for the state dir)",
   trace = "trace is cut — read the daemon log file directly (see /freeflow status for the state dir)",
   update = "update is cut — update by re-copying src/*.ts from a fresh pi-freeflow clone",
+  autoupdate = "autoupdate is cut — the vendored copy never self-updates; update by re-copying src/*.ts",
   hide = "no status widget in maki — nothing to hide",
   show = "no status widget in maki — nothing to show",
   widget = "no status widget in maki",

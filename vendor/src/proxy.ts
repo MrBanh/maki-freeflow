@@ -28,28 +28,32 @@ import {
  PATH_TRAVERSAL_PATTERN,
  MAX_BODY_BYTES,
  PORT,
+ OVH_CHAT_URL,
  UPSTREAM_HEADER_TIMEOUT_MS,
  UPSTREAM_OPENCODE,
  opencodeHeaders,
 } from "./config.ts";
 
 import {
- convertSseToJson,
- enforceOpencodeFingerprint,
- sseToChatCompletionJson,
- type CaseRestoreMap,
- type FindGlobRestore,
+	convertSseToJson,
+	enforceOpencodeFingerprint,
+	repairJsonToolArguments,
+	sseToChatCompletionJson,
+	type CaseRestoreMap,
+	type FindGlobRestore,
 } from "./opencode-fingerprint.ts";
 import { isDebugEnabled, log } from "./logger.ts";
-import { getModelUpstream, isClineModel, KILO_MODEL_IDS, MODEL_MAP, resolveCanonicalModelId } from "./models.ts";
+import { getModelUpstream, isClineModel, isOvhModel, KILO_MODEL_IDS, MODEL_MAP, ovhUpstreamModelId, resolveCanonicalModelId } from "./models.ts";
 import { ClineAuthError, refreshClineToken, toApiKey } from "./cline-device-auth.ts";
 import { rollChat } from "./cline-accounts.ts";
 import { fetchWithSystemCA } from "./system-ca-fetch.ts";
 import {
- chatResponsesJsonFromChatCompletion,
- chatResponsesSseFromChatCompletion,
- clineChatBodyFromResponsesBody,
- translateToolsForPath,
+	buildFindGlobRestore,
+	chatBodyFromResponsesBody,
+	chatResponsesJsonFromChatCompletion,
+	chatResponsesSseFromChatCompletion,
+	restoreToolNameForCaller,
+	translateToolsForPath,
 } from "./tool-translation.ts";
 import { buildArgRepairSchemas } from "./tool-args.ts";
 // normalize removed — host pi-ai already normalizes thinking/reasoning before proxy
@@ -76,6 +80,7 @@ import {
 import { pipeUpstreamStream, type StreamCloakOptions } from "./stream-pipe.ts";
 import {
  decideZenRoute,
+ isFreeTierGate,
  isUnprovenSession,
  isUpstreamGated,
  pickFailoverModel,
@@ -261,7 +266,7 @@ async function handleClineRequest(opts: {
  const model = typeof parsedBody.model === "string" ? parsedBody.model : "unknown";
  let chatBody: Record<string, unknown>;
  if (responsesRequest) {
-  chatBody = clineChatBodyFromResponsesBody(parsedBody);
+  chatBody = chatBodyFromResponsesBody(parsedBody);
  } else {
   chatBody = { ...parsedBody };
   if (Array.isArray(chatBody.tools)) chatBody.tools = translateToolsForPath(chatBody.tools, "/v1/chat/completions");
@@ -270,6 +275,10 @@ async function handleClineRequest(opts: {
  // Cline bypasses the fingerprint, but its arguments still malform the same
  // way: capture the caller's own schemas before translation for repair.
  const argSchemas = buildArgRepairSchemas(Array.isArray(parsedBody.tools) ? parsedBody.tools : []);
+ // Translation renames the caller's `find` to `glob` upstream and folds any
+ // name the upstream shape forbids; without this map the answer returns under
+ // a name Pi never registered.
+ const findGlob = buildFindGlobRestore(Array.isArray(parsedBody.tools) ? parsedBody.tools : []);
  chatBody.stream = true;
  let upstreamRes: Response;
  let limitHint: ClineLimitHint | undefined;
@@ -333,8 +342,8 @@ async function handleClineRequest(opts: {
    req,
    reqId,
    "direct",
-   argSchemas.size > 0
-    ? { callerHadTools: true, argSchemas, pathname: "/v1/chat/completions" }
+   findGlob.renamedFindToGlob || findGlob.renamed !== undefined || argSchemas.size > 0
+    ? { callerHadTools: true, argSchemas, findGlob, pathname: "/v1/chat/completions" }
     : undefined,
   );
   return;
@@ -351,7 +360,7 @@ async function handleClineRequest(opts: {
   return;
  }
  if (!responsesRequest) {
-  const data = convertSseToJson(sseText, pathname, true, undefined, undefined, undefined, argSchemas);
+ const data = convertSseToJson(sseText, pathname, true, undefined, findGlob, undefined, argSchemas);
   if (!res.headersSent) {
    res.writeHead(upstreamRes.status, { "content-type": "application/json" });
    res.end(data);
@@ -360,7 +369,7 @@ async function handleClineRequest(opts: {
   }
   return;
  }
- const chat = sseToChatCompletionJson(sseText, true, undefined, undefined, undefined, argSchemas);
+ const chat = sseToChatCompletionJson(sseText, true, undefined, findGlob, undefined, argSchemas);
  const resp = chatResponsesJsonFromChatCompletion(chat, model);
  if (clientRequestedStream) {
   if (!res.headersSent) {
@@ -385,11 +394,306 @@ async function handleClineRequest(opts: {
 }
 
 /**
+ * Serve an OVH-model request direct (never relay pool, no opencode
+ * fingerprint). Chat-only upstream: OVH's responses endpoint rejects every
+ * array `input` shape with 422 "input: data did not match any variant of
+ * untagged enum ResponseInput" and accepts only a bare string (probed
+ * 2026-10-13), so a responses-path body translates to chat upstream and the
+ * chat answer translates back — the same shape mapping the Cline lane uses.
+ * Keyless: no Authorization header, because OVH answers anonymous callers.
+ * Upstream always streams; callers that asked for plain JSON get the
+ * aggregated object, and a streamed responses caller gets SSE re-emitted
+ * from the mapped Responses object.
+ */
+async function handleOvhRequest(opts: {
+ parsedBody: Record<string, unknown>;
+ pathname: string;
+ req: http.IncomingMessage;
+ res: http.ServerResponse;
+ reqId: string;
+ clientRequestedStream: boolean;
+}): Promise<void> {
+ const { parsedBody, pathname, req, res, reqId, clientRequestedStream } = opts;
+ const responsesRequest = pathname.endsWith("/responses");
+ const requestedModel = typeof parsedBody.model === "string" ? parsedBody.model : "unknown";
+ let chatBody: Record<string, unknown>;
+ if (responsesRequest) {
+  chatBody = chatBodyFromResponsesBody(parsedBody);
+ } else {
+  chatBody = { ...parsedBody };
+  if (Array.isArray(chatBody.tools)) chatBody.tools = translateToolsForPath(chatBody.tools, "/v1/chat/completions");
+  delete chatBody.prompt_cache_key;
+ }
+ // OVH knows only the bare id. Canonicalise before stripping: a short alias
+ // (`llama-3.3-70b`) must resolve to `ovh-free/Meta-Llama-3_3-70B-Instruct`
+ // first, or it reaches OVH unrecognised and answers 404 model_not_found.
+ chatBody.model = ovhUpstreamModelId(requestedModel);
+ // Bypassing the fingerprint does not exempt OVH from malformed tool
+ // arguments: capture the caller's own schemas before translation for repair.
+ const argSchemas = buildArgRepairSchemas(Array.isArray(parsedBody.tools) ? parsedBody.tools : []);
+ // Translation renames the caller's `find` to `glob` upstream and folds any
+ // name the upstream shape forbids; without this map the answer returns under
+ // a name Pi never registered.
+ const findGlob = buildFindGlobRestore(Array.isArray(parsedBody.tools) ? parsedBody.tools : []);
+ chatBody.stream = true;
+ // Header-wait timeout + client-disconnect abort, cleared once headers arrive
+ // so a long stream is not killed at the timeout ceiling.
+ const controller = new AbortController();
+ const timeoutId = setTimeout(
+  () => controller.abort(upstreamTimeoutError()),
+  UPSTREAM_HEADER_TIMEOUT_MS,
+ );
+ const abortOnClientGone = () => {
+  if (!res.writableEnded) controller.abort();
+ };
+ res.once("close", abortOnClientGone);
+ req.once("error", abortOnClientGone);
+ let upstreamRes: Response;
+ try {
+  // Keyless, direct (never the relay pool). OVH serves anonymous callers but
+  // rate-limits them, so a 429 here is a real per-IP cap and must NOT carry
+  // the relay-deploy hint — this lane can never ride a relay.
+  upstreamRes = await fetch(OVH_CHAT_URL, {
+   method: "POST",
+   headers: { "Content-Type": "application/json" },
+   body: JSON.stringify(chatBody),
+   signal: controller.signal,
+  });
+ } catch (e) {
+  log("error", "ovh upstream fetch failed", { error: String(e), model: requestedModel }, reqId);
+  if (!res.headersSent) {
+   res.writeHead(502, { "content-type": "application/json" });
+   res.end(JSON.stringify({ error: "upstream error" }));
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ } finally {
+  clearTimeout(timeoutId);
+  res.off("close", abortOnClientGone);
+  req.off("error", abortOnClientGone);
+ }
+ if (res.writableEnded) {
+  try { await upstreamRes.body?.cancel(); } catch { }
+  return;
+ }
+ if (!upstreamRes.ok) {
+  log("warn", `ovh upstream ${upstreamRes.status} for model ${requestedModel}`, { status: upstreamRes.status, model: requestedModel }, reqId);
+  const raw = await upstreamRes.text().catch(() => null);
+  if (raw === null) {
+   log("error", "ovh upstream body unreadable", { status: upstreamRes.status, model: requestedModel }, reqId);
+   if (!res.headersSent) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "upstream error" }));
+   } else if (!res.writableEnded) {
+    res.end();
+   }
+   return;
+  }
+  if (!res.headersSent) {
+   res.writeHead(upstreamRes.status, { "content-type": upstreamRes.headers.get("content-type") || "application/json" });
+   res.end(raw);
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ }
+ if (!responsesRequest && clientRequestedStream && upstreamRes.body) {
+  res.writeHead(upstreamRes.status, {
+   "content-type": upstreamRes.headers.get("content-type") || "text/event-stream",
+   "cache-control": "no-cache, no-transform",
+   connection: "keep-alive",
+   "x-accel-buffering": "no",
+  });
+  // Fetched direct, never through the relay pool: attributing an OVH-side
+  // stream failure to an unrelated relay would mark a healthy relay failed.
+  pipeUpstreamStream(
+   Readable.fromWeb(upstreamRes.body as unknown as WebReadableStream),
+   res,
+   req,
+   reqId,
+   "direct",
+   findGlob.renamedFindToGlob || findGlob.renamed !== undefined || argSchemas.size > 0
+    ? { callerHadTools: true, argSchemas, findGlob, pathname: "/v1/chat/completions" }
+    : undefined,
+  );
+  return;
+ }
+ const sseText = await upstreamRes.text().catch(() => null);
+ if (sseText === null) {
+  log("error", "ovh upstream stream unreadable", { status: upstreamRes.status, model: requestedModel }, reqId);
+  if (!res.headersSent) {
+   res.writeHead(502, { "content-type": "application/json" });
+   res.end(JSON.stringify({ error: "upstream error" }));
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ }
+ if (!responsesRequest) {
+ const data = convertSseToJson(sseText, pathname, true, undefined, findGlob, undefined, argSchemas);
+  if (!res.headersSent) {
+   res.writeHead(upstreamRes.status, { "content-type": "application/json" });
+   res.end(data);
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ }
+ const chat = sseToChatCompletionJson(sseText, true, undefined, findGlob, undefined, argSchemas);
+ const resp = chatResponsesJsonFromChatCompletion(chat, requestedModel);
+ if (clientRequestedStream) {
+  if (!res.headersSent) {
+   res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+   });
+   res.end(chatResponsesSseFromChatCompletion(resp));
+  } else if (!res.writableEnded) {
+   res.end();
+  }
+  return;
+ }
+ if (!res.headersSent) {
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify(resp));
+ } else if (!res.writableEnded) {
+  res.end();
+ }
+}
+
+/**
+ * Keyless gateway handling for Kilo models (both direct Kilo models and
+ * Zen sessions failed over to Kilo). Serves chat completions and responses
+ * natively, repairs tool arguments, and recovers from 400 token overflows.
+ */
+async function handleKiloRequest(opts: {
+ parsedBody: Record<string, unknown>;
+ pathname: string;
+ req: http.IncomingMessage;
+ res: http.ServerResponse;
+ reqId: string;
+ clientRequestedStream: boolean;
+ sessionKey?: string | null;
+}): Promise<void> {
+ const { parsedBody, pathname, req, res, reqId, clientRequestedStream, sessionKey } = opts;
+ const isStream = clientRequestedStream;
+ const kiloController = new AbortController();
+ const kiloArgSchemas = buildArgRepairSchemas(Array.isArray(parsedBody.tools) ? parsedBody.tools : []);
+ const kiloTimeoutId = setTimeout(
+  () => kiloController.abort(upstreamTimeoutError()),
+  UPSTREAM_HEADER_TIMEOUT_MS,
+ );
+ const abortKiloOnClientGone = () => {
+  if (!res.writableEnded) kiloController.abort();
+ };
+ res.once("close", abortKiloOnClientGone);
+ req.once("error", abortKiloOnClientGone);
+ let response: Response;
+ const kiloUrl = pathname.endsWith("/responses") ? KILO_RESPONSES_URL : KILO_CHAT_URL;
+ try {
+  response = await relayFetch(
+   kiloUrl,
+   {
+    method: "POST",
+    headers: {
+     "Content-Type": "application/json",
+    },
+    body: JSON.stringify(parsedBody),
+    signal: kiloController.signal,
+   },
+   reqId,
+  );
+  if (response.status === 400 && !res.writableEnded) {
+   const retryBody = { ...parsedBody };
+   let changed = false;
+   if (typeof retryBody.max_output_tokens === "number" && retryBody.max_output_tokens > 4096) {
+    retryBody.max_output_tokens = 4096;
+    changed = true;
+   }
+   if (typeof retryBody.max_tokens === "number" && retryBody.max_tokens > 4096) {
+    retryBody.max_tokens = 4096;
+    changed = true;
+   }
+   if (retryBody.model === "dots-studio/dots-3-note-preview:free") {
+    retryBody.model = "nvidia/nemotron-3.5-lightning:free";
+    changed = true;
+   }
+   if (changed) {
+    log("warn", `kilo 400 for model ${String(parsedBody.model)} — retrying with clamped tokens`, { model: parsedBody.model }, reqId);
+    try {
+     const retryRes = await relayFetch(
+      kiloUrl,
+      {
+       method: "POST",
+       headers: {
+        "Content-Type": "application/json",
+       },
+       body: JSON.stringify(retryBody),
+       signal: kiloController.signal,
+      },
+      reqId,
+     );
+     if (retryRes.ok) {
+      log("info", `kilo 400 recovery succeeded with model ${String(retryBody.model)}`, { model: retryBody.model }, reqId);
+      response = retryRes;
+     }
+    } catch { }
+   }
+  }
+ } finally {
+  clearTimeout(kiloTimeoutId);
+  res.off("close", abortKiloOnClientGone);
+  req.off("error", abortKiloOnClientGone);
+ }
+ if (response.ok) recordUpstreamSuccess("kilo", { sessionKey });
+
+ if (isStream && response.ok && response.body) {
+  const ct = response.headers.get("content-type") || "text/event-stream";
+  res.writeHead(response.status, {
+   "content-type": ct,
+   "cache-control": "no-cache, no-transform",
+   connection: "keep-alive",
+   "x-accel-buffering": "no",
+  });
+  pipeUpstreamStream(
+   Readable.fromWeb(
+    response.body as unknown as WebReadableStream,
+   ),
+   res,
+   req,
+   reqId,
+   undefined,
+   kiloArgSchemas.size > 0
+    ? {
+     callerHadTools: true,
+     argSchemas: kiloArgSchemas,
+     pathname: pathname.endsWith("/responses") ? "/v1/responses" : "/v1/chat/completions",
+    }
+    : undefined,
+  );
+ } else {
+  let rawText = await response.text();
+  if (response.ok && kiloArgSchemas.size > 0) {
+   rawText = convertSseToJson(rawText, pathname, true, undefined, undefined, undefined, kiloArgSchemas);
+   rawText = repairJsonToolArguments(rawText, pathname, kiloArgSchemas);
+  }
+  const data = withRateLimitHint(response.status, rawText);
+  const ct = response.headers.get("content-type") || "application/json";
+  res.writeHead(response.status, { "content-type": ct });
+  res.end(data);
+ }
+}
+
+
+/**
  * Relay eligibility: only free-catalog models ride relay egress. Returns true
  * when the model is a non-empty string present in MODEL_MAP or KILO_MODEL_IDS
  * (Kilo traffic leaves via its own branch regardless), and when the model is
  * missing/empty (e.g. GET /v1/models carries no body — preserve routing).
- * Cline models are direct-only and never relay-eligible. Anything else
+ * Cline and OVH models are direct-only and never relay-eligible. Anything else
  * (unknown/paid model ids, non-strings) goes direct upstream.
  */
 export function isRelayEligibleModel(model: unknown): boolean {
@@ -397,7 +701,7 @@ export function isRelayEligibleModel(model: unknown): boolean {
  if (typeof model !== "string") return false;
  if (model.trim() === "") return true;
  const canonical = resolveCanonicalModelId(model.trim());
- if (isClineModel(canonical)) return false;
+ if (isClineModel(canonical) || isOvhModel(canonical)) return false;
  return MODEL_MAP.has(canonical) || KILO_MODEL_IDS.has(canonical) || isFreeCatalogId(canonical);
 }
 
@@ -506,20 +810,16 @@ export function sanitizeHeaders(
  // duplicate (case-differing) User-Agent pair — upstream resets connections
  // that send two conflicting User-Agent headers.
  delete sanitized["user-agent"];
- // Upstream /inference/v1 treats x-opencode-request: msg_* as a non-OpenCode
- // client signal (403 FreeTierError). Never forward a caller-supplied value;
- // opencodeHeaders() no longer emits it.
- delete sanitized["x-opencode-request"];
  Object.assign(sanitized, opencodeHeaders());
  sanitized["accept-encoding"] = "identity";
  sanitized.connection = "keep-alive";
  return sanitized;
 }
-export async function isProxyAlive(port: number): Promise<boolean> {
+export async function isProxyAlive(port: number, timeoutMs = 600): Promise<boolean> {
  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
  try {
   const res = await fetch(`http://${HOST}:${port}/v1/models`, {
-   signal: AbortSignal.timeout(1500),
+   signal: AbortSignal.timeout(timeoutMs),
   });
   const ct = res.headers.get("content-type") || "";
   return res.ok && ct.includes("application/json");
@@ -639,31 +939,42 @@ function killViaProcNet(port: number): boolean {
 
 export async function killPortHolder(port: number): Promise<boolean> {
  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
- try {
-  if (process.platform === "win32") {
-   try {
-    const out = execSync(`netstat -ano | findstr :${port}`, {
-     encoding: "utf8",
-     timeout: 3000,
-     windowsHide: true,
-    }) as string;
-    for (const line of out.split("\n")) {
-     if (!line.includes("LISTENING")) continue;
-     const parts = line.trim().split(/\s+/);
-     // Match the port on the Local Address column only — a raw
-     // substring match can hit longer ports (:2818 vs :28180).
-     if (!parts[1] || !parts[1].endsWith(`:${port}`)) continue;
-     const pid = parts[parts.length - 1];
-     if (!pid || !/^\d+$/.test(pid)) continue;
-     // Windows netstat report: 127.0.0.1:38180 ... LISTENING/PID
-     if (Number(pid) === process.pid) continue; // never self-kill
-     execSync(`taskkill /F /PID ${pid}`, { timeout: 3000, stdio: "ignore", windowsHide: true });
-     return true;
-    }
-   } catch { }
-   return false;
-  }
-  try {
+	try {
+		try {
+			await fetch(`http://${HOST}:${port}/_shutdown`, {
+				method: "POST",
+				signal: AbortSignal.timeout(300),
+			});
+			for (let i = 0; i < 6; i++) {
+				await new Promise<void>((r) => setTimeout(r, 50));
+				if (!(await isProxyAlive(port))) return true;
+			}
+		} catch { }
+		if (process.platform === "win32") {
+			try {
+				const out = execSync(`netstat -ano | findstr :${port}`, {
+					encoding: "utf8",
+					timeout: 3000,
+					windowsHide: true,
+				}) as string;
+				let killed = false;
+				for (const line of out.split("\n")) {
+					if (!line.includes("LISTENING")) continue;
+					const parts = line.trim().split(/\s+/);
+					if (!parts[1] || !parts[1].endsWith(`:${port}`)) continue;
+					const pid = parts[parts.length - 1];
+					if (!pid || !/^\d+$/.test(pid)) continue;
+					if (Number(pid) === process.pid) continue; // never self-kill
+					try {
+						execSync(`taskkill /F /T /PID ${pid}`, { timeout: 3000, stdio: "ignore", windowsHide: true });
+						killed = true;
+					} catch { }
+				}
+				if (killed) return true;
+			} catch { }
+			return false;
+		}
+		try {
    const out = execSync(`lsof -ti tcp:${port} 2>/dev/null || fuser -n tcp ${port} 2>/dev/null`, {
     encoding: "utf8",
     timeout: 3000,
@@ -939,7 +1250,7 @@ export function startProxy(
      id: m.id,
      object: "model",
      created: 0,
-     owned_by: m.source === "kilo" ? "kilocode" : m.source === "cline" ? "clinecode" : "opencode",
+     owned_by: m.source === "kilo" ? "kilocode" : m.source === "cline" ? "clinecode" : m.source === "ovh" ? "ovhcloud" : "opencode",
     })),
    });
    res.writeHead(200, {
@@ -1011,6 +1322,7 @@ export function startProxy(
    const bodyStr = Buffer.concat(bodyChunks).toString();
    let isKilo = false;
    let isCline = false;
+   let isOvh = false;
    let parsedBody: Record<string, unknown> | null = null;
    let clientRequestedStream = false;
 
@@ -1020,8 +1332,10 @@ export function startProxy(
      const canonical = resolveCanonicalModelId(parsedBody.model);
      if (isClineModel(canonical)) {
       isCline = true;
-     } else if (KILO_MODEL_IDS.has(canonical)) {
-      isKilo = true;
+    } else if (isOvhModel(canonical)) {
+     isOvh = true;
+    } else if (KILO_MODEL_IDS.has(canonical)) {
+     isKilo = true;
      }
     }
     if (parsedBody && typeof parsedBody === "object") {
@@ -1059,7 +1373,7 @@ export function startProxy(
    let callerFindGlob: FindGlobRestore | undefined;
   let callerInjected: string[] | undefined;
   let callerArgSchemas: Map<string, Record<string, unknown>> | undefined;
-   if (!isKilo && !isCline && parsedBody) {
+   if (!isKilo && !isCline && !isOvh && parsedBody) {
     const fp = enforceOpencodeFingerprint(parsedBody, target.pathname);
     callerHadTools = fp.callerHadTools;
     callerCaseRestore = fp.caseRestore;
@@ -1070,8 +1384,8 @@ export function startProxy(
    }
    // Streaming cloak: thread this request's placeholder records into the SSE
    // pipe so streamed deltas get the same strip+restore as aggregated bodies.
-   // Kilo/Cline bypass the fingerprint, so their streams stay verbatim.
-   const streamCloak: StreamCloakOptions | undefined = !isKilo && !isCline && callerInjected !== undefined
+   // Kilo/Cline/OVH bypass the fingerprint, so their streams stay verbatim.
+   const streamCloak: StreamCloakOptions | undefined = !isKilo && !isCline && !isOvh && callerInjected !== undefined
     ? { callerHadTools, caseRestore: callerCaseRestore, findGlob: callerFindGlob, injected: callerInjected, argSchemas: callerArgSchemas, pathname: target.pathname }
     : undefined;
 
@@ -1082,7 +1396,7 @@ export function startProxy(
    // anthropic-messages models reach /v1/messages. A request on the wrong path
    // means the host still holds a pre-fix provider registration (stale disk
    // cache or no restart after upgrade) and upstream answers 500.
-   if (!isKilo && !isCline && typeof parsedBody?.model === "string") {
+   if (!isKilo && !isCline && !isOvh && typeof parsedBody?.model === "string") {
     const knownDef = MODEL_MAP.get(String(parsedBody.model));
     if (target.pathname.endsWith("/chat/completions") && knownDef?.api && knownDef.api !== "openai-completions") {
      log("warn", `model ${String(parsedBody.model)} expects ${knownDef.api} but got ${target.pathname} — stale provider registration (restart Pi/OMP after upgrade)`, { model: String(parsedBody.model), path: target.pathname }, reqId);
@@ -1099,130 +1413,20 @@ export function startProxy(
      // token: the proxy only passes the body and maps the answer.
      await handleClineRequest({ parsedBody, pathname: target.pathname, req, res, reqId, clientRequestedStream });
     } else if (isKilo && parsedBody) {
-     // Header-wait timeout + client-disconnect abort: once headers
-     // arrive the timer is cleared so a long stream is not killed at
-     // the timeout ceiling; the stream phase is owned by
-     // pipeUpstreamStream and its close handling.
-     const kiloController = new AbortController();
-     // Kilo bodies ride verbatim, but its models malform arguments the same
-     // way: capture the caller's schemas so the reply can be repaired too.
-     const kiloArgSchemas = buildArgRepairSchemas(Array.isArray(parsedBody.tools) ? parsedBody.tools : []);
-     const kiloTimeoutId = setTimeout(
-      () => kiloController.abort(upstreamTimeoutError()),
-      UPSTREAM_HEADER_TIMEOUT_MS,
-     );
-     const abortKiloOnClientGone = () => {
-      if (!res.writableEnded) kiloController.abort();
-     };
-     res.once("close", abortKiloOnClientGone);
-     req.once("error", abortKiloOnClientGone);
-     let response: Response;
-     // Kilo serves both wire APIs natively: responses-shaped bodies go to
-     // its responses endpoint, chat bodies to chat completions. Sending a
-     // responses body to the chat URL (or vice versa) would 400.
-     const kiloUrl = target.pathname.endsWith("/responses") ? KILO_RESPONSES_URL : KILO_CHAT_URL;
-     try {
-      response = await relayFetch(
-       kiloUrl,
-       {
-        method: "POST",
-        headers: {
-         // Keyless, like Zen: Kilo's gateway rejects a placeholder bearer
-         // (live 2026-09-22 — "Bearer kilo-free" answers 401 INVALID_TOKEN,
-         // omitting Authorization answers 200 for every free catalog model).
-         "Content-Type": "application/json",
-        },
-        body: JSON.stringify(parsedBody),
-        signal: kiloController.signal,
-       },
-       reqId,
-      );
-      // Kilo 400 recovery: if upstream Kilo rejected the body with 400 (e.g.
-      // prompt + max_output_tokens exceeded model's operational context limit),
-      // retry once with clamped max tokens and fallback to a 1M model.
-      if (response.status === 400 && !res.writableEnded) {
-       const retryBody = { ...parsedBody };
-       let changed = false;
-       if (typeof retryBody.max_output_tokens === "number" && retryBody.max_output_tokens > 4096) {
-        retryBody.max_output_tokens = 4096;
-        changed = true;
-       }
-       if (typeof retryBody.max_tokens === "number" && retryBody.max_tokens > 4096) {
-        retryBody.max_tokens = 4096;
-        changed = true;
-       }
-       if (retryBody.model === "dots-studio/dots-3-note-preview:free") {
-        retryBody.model = "nvidia/nemotron-3.5-lightning:free";
-        changed = true;
-       }
-       if (changed) {
-        log("warn", `kilo 400 for model ${String(parsedBody.model)} — retrying with clamped tokens`, { model: parsedBody.model }, reqId);
-        try {
-         const retryRes = await relayFetch(
-          kiloUrl,
-          {
-           method: "POST",
-           headers: {
-            "Content-Type": "application/json",
-           },
-           body: JSON.stringify(retryBody),
-           signal: kiloController.signal,
-          },
-          reqId,
-         );
-         if (retryRes.ok) {
-          log("info", `kilo 400 recovery succeeded with model ${String(retryBody.model)}`, { model: retryBody.model }, reqId);
-          response = retryRes;
-         }
-        } catch { }
-       }
-      }
-     } finally {
-      clearTimeout(kiloTimeoutId);
-      res.off("close", abortKiloOnClientGone);
-      req.off("error", abortKiloOnClientGone);
-     }
-     if (response.ok) recordUpstreamSuccess("kilo", { sessionKey });
-
-     if (isStream && response.ok && response.body) {
-      const ct =
-       response.headers.get("content-type") || "text/event-stream";
-      res.writeHead(response.status, {
-       "content-type": ct,
-       "cache-control": "no-cache, no-transform",
-       connection: "keep-alive",
-       "x-accel-buffering": "no",
-      });
-      // Kilo is fetched directly (not via the relay pool), so pass undefined as
-      // the issuer: attributing kilo-side stream failures to an unrelated
-      // opencode relay would mark a healthy relay as failed.
-      pipeUpstreamStream(
-       Readable.fromWeb(
-        response.body as unknown as WebReadableStream,
-       ),
-       res,
-       req,
-       reqId,
-       undefined,
-       kiloArgSchemas.size > 0
-        ? {
-         callerHadTools: true,
-         argSchemas: kiloArgSchemas,
-         pathname: target.pathname.endsWith("/responses") ? "/v1/responses" : "/v1/chat/completions",
-        }
-        : undefined,
-      );
-     } else {
-      let rawText = await response.text();
-      if (response.ok && kiloArgSchemas.size > 0) {
-       rawText = convertSseToJson(rawText, target.pathname, true, undefined, undefined, undefined, kiloArgSchemas);
-      }
-      const data = withRateLimitHint(response.status, rawText);
-      const ct = response.headers.get("content-type") || "application/json";
-      res.writeHead(response.status, { "content-type": ct });
-      res.end(data);
-     }
-    } else {
+     await handleKiloRequest({
+      parsedBody,
+      pathname: target.pathname,
+      req,
+      res,
+      reqId,
+      clientRequestedStream,
+      sessionKey,
+     });
+   } else if (isOvh && parsedBody) {
+    // OVH serves chat upstream only (see handleOvhRequest): direct, keyless,
+    // no fingerprint, and a responses-path body translated to chat and back.
+    await handleOvhRequest({ parsedBody, pathname: target.pathname, req, res, reqId, clientRequestedStream });
+   } else {
      // OpenCode routing — relay egress is for free-catalog models
      // only; unknown/paid models go direct upstream.
      const relayState = getActiveRelayState();
@@ -1638,14 +1842,14 @@ export function startProxy(
       // Gated upstream: a 403 free-tier gate is a final answer, not a
       // stream — buffer it and attach the recovery hint instead of
       // piping it through as a stream body.
-      if (upstreamRes.status === 403) {
-       const data = withFreeTierHint(403, await upstreamRes.text());
+     if (upstreamRes.status === 403) {
+      const rawText403 = await upstreamRes.text();
+       const data = withFreeTierHint(403, rawText403);
        const ct403 = upstreamRes.headers.get("content-type") || "application/json";
        res.writeHead(403, { "content-type": ct403 });
        res.end(data);
        return;
       }
-
       const outHeaders: Record<string, string> = {};
       for (const h of ["content-type", "cache-control", "x-request-id"] as const) {
        const v = upstreamRes.headers.get(h);

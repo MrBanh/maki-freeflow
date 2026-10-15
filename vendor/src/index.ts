@@ -1,7 +1,7 @@
 /**
  * pi-freeflow — Modular, high-resiliency LLM extension for Pi & Oh My Pi (OMP)
  *
- * Provides access to 30 free models (10 OpenCode Zen + 15 KiloCode Gateway + 5 Cline) with:
+ * Provides access to 35 free models (11 OpenCode Zen + 14 KiloCode Gateway + 2 Cline + 8 OVH) with:
  * - Single-port daemon reuse on 28180 across concurrent subagents
  * - Multi-cloud rolling egress relays (Vercel Edge, Cloudflare, Deno)
  * - 0ms instant startup with verified static catalog and background live health checks
@@ -126,7 +126,7 @@ export function buildProviderConfig(
     id: m.id,
     name: m.name,
     api: m.api,
-    owned_by: m.source === "kilo" ? "kilocode" : m.source === "cline" ? "clinecode" : "opencode",
+    owned_by: m.source === "kilo" ? "kilocode" : m.source === "cline" ? "clinecode" : m.source === "ovh" ? "ovhcloud" : "opencode",
     reasoning: m.reasoning,
     thinking: m.reasoning
      ? {
@@ -146,7 +146,7 @@ export function buildProviderConfig(
      }
      : m.api === "openai-responses"
       ? { sessionAffinityFormat: "openai-nosession" }
-      : m.source === "kilo" || m.source === "cline"
+      : m.source === "kilo" || m.source === "cline" || m.source === "ovh"
        ? {
         supportsDeveloperRole: false,
         supportsReasoningEffort: !!m.thinkingLevelMap,
@@ -185,6 +185,7 @@ export default async function(pi: ExtensionAPI): Promise<void> {
    buildProviderConfig(models, actualPort),
   );
  };
+ registerCatalog(registeredCatalog);
  const ensureDaemon = async (ui?: ExtensionUIContext): Promise<void> => {
   const reattach = (port: number): void => {
    if (port !== actualPort) {

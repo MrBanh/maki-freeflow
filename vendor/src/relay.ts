@@ -120,7 +120,7 @@ export interface RelayAffinity {
 /**
  * Fetch a target URL through the active relay pool with rolling failover and direct fallback.
  *
-  * @param url Full upstream destination URL (e.g. https://opencode.ai/inference/v1/chat/completions)
+ * @param url Full upstream destination URL (e.g. https://opencode.ai/zen/v1/chat/completions)
  * @param opts Standard fetch RequestInit options
  * @param reqId Optional correlation request ID for end-to-end tracing
  * @param affinity Per-conversation affinity: `preferred` is tried first when it

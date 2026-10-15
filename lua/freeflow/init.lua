@@ -1,7 +1,8 @@
 -- freeflow: MVP port of pi-freeflow (https://github.com/trefeon/pi-freeflow)
 -- to maki as a Lua plugin. Architecture: keep-Node-daemon + thin Lua plugin.
 --
---   * The daemon (vendored VERBATIM under vendor/src/*.ts + vendor/package.json,
+--   * The daemon (vendored under vendor/src/*.ts + vendor/package.json,
+--     see vendor/VENDORED.md for pinned upstream version and local patches,
 --     plus node_modules/undici for relay.ts's static `import { Agent }`) owns
 --     port 127.0.0.1:28180 and all routing/upstream logic. Lua never edits it.
 --   * Lua owns: daemon lifecycle (probe/attach/heartbeat/respawn, never kill),

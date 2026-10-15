@@ -1,6 +1,6 @@
 -- Relay-state access for the freeflow plugin.
 --
--- SPIKE FINDING (verified live against the vendored daemon v1.34.0):
+-- SPIKE FINDING (verified live against the vendored daemon, see vendor/VENDORED.md):
 -- relay-state.ts getActiveRelayState / getOrderedRelayUrls re-read the state
 -- file whenever its mtime moves, and mutations go through CAS withRelayState
 -- (freshest-disk-state + atomic tmp+rename + lock file). So an external

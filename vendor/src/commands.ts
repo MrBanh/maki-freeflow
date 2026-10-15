@@ -36,6 +36,7 @@ import {
  saveDebugState,
 } from "./logger.ts";
 import { probeRelay } from "./probe.ts";
+import { killPortHolder } from "./proxy.ts";
 import { getUpstreamHealth, resetUpstreamGate } from "./upstream-health.ts";
 import {
  buildRelayExport,
@@ -515,7 +516,7 @@ export function createCommandSpec(
 ): Omit<RegisteredCommand, "name"> {
  return {
   description:
-   "Relay egress: auto | spread | on | off | hide | show | widget hide/show | status | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | debug on|off | refresh | update | deploy cloudflare | deploy deno | deploy vercel | install-startup | uninstall-startup | cline login [--key] [slot] | cline accounts | cline logout [slot]",
+   "Relay egress: auto | spread | on | off | hide | show | widget hide/show | status | add <URL> [name] | list | use <URL|name|index> [name] | label <target> <name> | remove <target> | test [target|opencode] [--chat] | export [path] [--include-secrets] | import <path> [--merge|--replace] [--dry-run] | logs [level] [n] | debug on|off | refresh | update [auto on|off] | autoupdate [on|off] | deploy cloudflare | deploy deno | deploy vercel | install-startup | uninstall-startup | cline login [--key] [slot] | cline accounts | cline logout [slot]",
   getArgumentCompletions: (prefix: string) =>
    [
     "auto",
@@ -537,6 +538,12 @@ export function createCommandSpec(
     "test",
     "test opencode",
     "url",
+    "autoupdate",
+    "autoupdate on",
+    "autoupdate off",
+    "update auto",
+    "update auto on",
+    "update auto off",
     "deploy",
     "deploy cloudflare",
     "deploy deno",
@@ -1173,7 +1180,7 @@ export function createCommandSpec(
     const deadLine = deadParked.length
      ? `\nDead relays (HTTP 402 disabled deployment, parked): ${deadParked.map((r) => r.url).join(", ")} — delete the Vercel project, run /freeflow remove <url>, then deploy Cloudflare`
      : "";
-    ctx.ui.notify(`${modeLine} | ${poolLine}\n${stateFileLine}\nUpstream: ${upstreamLine}\n${clineLine}${deadLine}`, "info");
+    ctx.ui.notify(`${modeLine} | ${poolLine} | auto-update: ${relayState.autoUpdate ? "on" : "off"}\n${stateFileLine}\nUpstream: ${upstreamLine}\n${clineLine}${deadLine}`, "info");
    } else if (sub === "kill" || sub === "stop" || sub === "shutdown") {
     const port = getClientPort() || PORT;
     try {
@@ -1188,6 +1195,20 @@ export function createCommandSpec(
      }
     } catch {
      ctx.ui.notify("Daemon not running or not reachable", "warning");
+    }
+   } else if (sub === "autoupdate" || (sub === "update" && rest.trim().toLowerCase().startsWith("auto"))) {
+    const arg = sub === "autoupdate"
+     ? rest.trim().toLowerCase()
+     : rest.trim().slice(4).trim().toLowerCase();
+    if (arg === "on" || arg === "enable" || arg === "true" || arg === "1") {
+     withRelayState((s) => { s.autoUpdate = true; return s; });
+     ctx.ui.notify("Auto-update enabled (new versions will be installed automatically).", "info");
+    } else if (arg === "off" || arg === "disable" || arg === "false" || arg === "0") {
+     withRelayState((s) => { s.autoUpdate = false; return s; });
+     ctx.ui.notify("Auto-update disabled.", "info");
+    } else {
+     const current = loadRelayState().autoUpdate ? "ON" : "OFF";
+     ctx.ui.notify(`Auto-update is currently ${current}. Use '/freeflow autoupdate on|off'`, "info");
     }
    } else if (sub === "update") {
     if (isLinkedInstall()) {
@@ -1250,7 +1271,8 @@ export function createCommandSpec(
          }
         }
         if (code === 0) {
-         ctx.ui.notify(`Updated to ${latest} — restart your host app`, "info");
+         try { await killPortHolder(PORT); } catch { }
+         ctx.ui.notify(`Updated to ${latest} and restarted proxy daemon`, "info");
         } else {
          ctx.ui.notify(
           `Update failed (exit ${code}) — try manually: ${manual}`,
@@ -1844,7 +1866,7 @@ export function createCommandSpec(
      const pf = parseDeployPlatform(rest);
      if (!pf) {
       ctx.ui.notify(
-       "Unknown platform. Use: cloudflare | deno | vercel",
+       "Unknown platform. Use: cloudflare | deno | vercel (for self-hosted VPS, see https://github.com/trefeon/warp-relay-pool)",
        "warning",
       );
      } else {

@@ -31,10 +31,20 @@ export const OPENCODE_API_URL = `${UPSTREAM_OPENCODE}/v1`;
 // supplied at call time (never stored here).
 export const CLINE_API_BASE = "https://api.cline.bot/api/v1";
 export const CLINE_CHAT_URL = `${CLINE_API_BASE}/chat/completions`;
+// OVHcloud AI Endpoints serves OpenAI-compatible chat completions with no
+// credential at all (probed keyless 2026-10-13: no Authorization header,
+// 200). Direct-only: OVH has no Zen-style per-IP gate to route around, so
+// it never rides the relay pool and is deliberately absent from the deployed
+// relay allowlist (src/deploy.ts), which keeps the relay surface at exactly
+// two upstreams. Chat-only: OVH's responses endpoint rejects every array
+// input shape with 422 "input: data did not match any variant of untagged
+// enum ResponseInput" and accepts only a bare string (probed 2026-10-13), so
+// a responses-path caller is translated to chat upstream and back.
+export const OVH_API_BASE = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1";
+export const OVH_CHAT_URL = `${OVH_API_BASE}/chat/completions`;
 
 // ── Network & Server defaults ───────────────────────────────────────
 export const DEFAULT_PORT = 28180;
-export const LEGACY_PORT = 18080;
 export const HOST = "127.0.0.1";
 
 export function resolvePort(): number {
@@ -63,7 +73,7 @@ export const PORT = resolvePort();
 // OPENCODE_VERSION_FLOOR pins the minimum; OPENCODE_VERSION_FALLBACK is the
 // last-known-good npm version used when the live lookup is stale/offline.
 export const OPENCODE_VERSION_FLOOR = "1.17.0";
-export const OPENCODE_VERSION_FALLBACK = "1.18.34";
+export const OPENCODE_VERSION_FALLBACK = "1.19.0";
 /** Live npm lookup TTL: 6h — within one window the cached UA is reused. */
 export const OPENCODE_VERSION_TTL_MS = 6 * 60 * 60 * 1_000;
 /** Env override: exact `opencode/<version>` UA (or bare version) for tests/pins. */

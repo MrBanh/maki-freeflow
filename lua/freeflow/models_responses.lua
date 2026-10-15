@@ -3,7 +3,7 @@
 -- /v1/responses path (proxy.ts warns on chat-path use; Kilo picks the
 -- responses URL by pathname ending in /responses).
 --
--- Transcribed from pi-freeflow src/models.ts (v1.34.0).
+-- Transcribed from pi-freeflow src/models.ts (pinned version, see vendor/VENDORED.md).
 -- No thinking_fields here: effort rides via the build_body hook
 -- (opts.thinking -> body.reasoning.effort), which the daemon clamps
 -- per model in normalizeResponsesBody.

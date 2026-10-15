@@ -1,8 +1,9 @@
 # maki-freeflow
 
 Maki providers backed by the [pi-freeflow](https://github.com/trefeon/pi-freeflow)
-daemon (v1.34.0, MIT © trefeon), vendored verbatim under `vendor/`. See
-[LICENSE](./LICENSE). Requires Node 22.19+ or Bun. The daemon starts on demand at `127.0.0.1:28180`.
+daemon (MIT © trefeon), vendored under `vendor/`. Pinned upstream version
+and sync status: [vendor/VENDORED.md](./vendor/VENDORED.md)
+(`vendor/package.json` is the machine-readable version). Requires Node 22.19+ or Bun. The daemon starts on demand at `127.0.0.1:28180`.
 
 ## Setup
 

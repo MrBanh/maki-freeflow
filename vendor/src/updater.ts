@@ -10,6 +10,10 @@
 
 import { spawnSync } from "node:child_process";
 
+import { fetchLatestVersion, getLocalVersion, compareVersions } from "./update-checker.ts";
+import { killPortHolder } from "./proxy.ts";
+import { PORT } from "./config.ts";
+
 export interface GlobalUpdatePlan {
 	/** Binary to run. */
 	cmd: string;
@@ -89,4 +93,63 @@ export function isCommandAvailable(cmd: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Automatically perform an update to the latest published version and
+ * restart the local proxy daemon.
+ */
+export async function performAutoUpdate(
+	onProgress?: (message: string) => void,
+): Promise<{ ok: boolean; version?: string; error?: string }> {
+	const latest = await fetchLatestVersion();
+	if (!latest) return { ok: false, error: "could not fetch latest version" };
+	const local = getLocalVersion();
+	if (compareVersions(latest, local) <= 0) {
+		return { ok: true, version: local };
+	}
+	onProgress?.(`Auto-updating pi-freeflow: v${local} → v${latest}…`);
+
+	const hostSteps = selectHostUpdateSteps({
+		ompAvailable: isCommandAvailable("omp"),
+		piAvailable: isCommandAvailable("pi"),
+	});
+	let code = 1;
+	for (const step of hostSteps) {
+		try {
+			const res = spawnSync(step.cmd, step.args, {
+				stdio: "ignore",
+				timeout: 120_000,
+				windowsHide: true,
+				shell: process.platform === "win32",
+			});
+			if (res.status === 0) {
+				code = 0;
+				break;
+			}
+		} catch { }
+	}
+	if (code !== 0) {
+		const plan = selectGlobalUpdatePlan({
+			npmAvailable: isCommandAvailable("npm"),
+			bunAvailable: isCommandAvailable("bun"),
+		});
+		if (plan) {
+			try {
+				const res = spawnSync(plan.cmd, plan.args, {
+					stdio: "ignore",
+					timeout: 120_000,
+					windowsHide: true,
+					shell: process.platform === "win32",
+				});
+				if (res.status === 0) code = 0;
+			} catch { }
+		}
+	}
+	if (code === 0) {
+		onProgress?.(`pi-freeflow auto-updated to v${latest} — restarting proxy daemon…`);
+		await killPortHolder(PORT);
+		return { ok: true, version: latest };
+	}
+	return { ok: false, error: `update command failed (exit code ${code})` };
 }

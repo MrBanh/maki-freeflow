@@ -32,7 +32,6 @@ import {
  DAEMON_WATCHDOG_MS,
  DAEMON_WATCHDOG_MS_ENV,
  HOST,
- LEGACY_PORT,
  LOG_FILE,
  NO_KILL_ENV,
  OPENCODE_VERSION_TTL_MS,
@@ -198,7 +197,8 @@ export function resolveDaemonRuntime(opts?: {
 }
 
 function daemonScriptPath(): string {
- return path.join(path.dirname(fileURLToPath(import.meta.url)), "daemon.ts");
+	const p = path.join(path.dirname(fileURLToPath(import.meta.url)), "daemon.ts");
+	return process.platform === "win32" ? p.replace(/\\/g, "/") : p;
 }
 
 function getHeartbeatMs(): number {
@@ -581,17 +581,19 @@ async function killStaleDaemon(
   remoteVer,
   expected: PKG_VERSION,
  });
- await killPortHolder(port);
- for (let i = 0; i < 10; i++) {
-  await new Promise<void>((r) => setTimeout(r, 200));
-  if (!(await isProxyAlive(port))) return true;
- }
- logInfo(
-  `Reusing existing pi-freeflow proxy daemon on http://${HOST}:${port} (stale kill did not free port)`,
- );
- return false;
+	await killPortHolder(port);
+	for (let i = 0; i < 15; i++) {
+		await new Promise<void>((r) => setTimeout(r, 100));
+		if (!(await isProxyAlive(port))) {
+			lastSpawnAt = 0;
+			return true;
+		}
+	}
+	logInfo(
+		`Reusing existing pi-freeflow proxy daemon on http://${HOST}:${port} (stale kill did not free port)`,
+	);
+	return false;
 }
-
 /**
  * Open the shared log file for the detached daemon's stdout/stderr so a
  * native abort or crash leaves its reason on disk instead of vanishing into
@@ -770,28 +772,28 @@ function spawnDaemonProcess(): boolean {
 }
 
 async function waitForReady(port: number, timeoutMs: number): Promise<boolean> {
- const deadline = Date.now() + timeoutMs;
- while (Date.now() < deadline) {
-  if (await isProxyAlive(port)) return true;
-  await new Promise<void>((r) => setTimeout(r, 200));
- }
- return false;
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await isProxyAlive(port, 150)) return true;
+		await new Promise<void>((r) => setTimeout(r, 80));
+	}
+	return false;
 }
 
 async function probeAndMaybeReplace(
- port: number,
- label: string,
+	port: number,
+	label: string,
+	probeTimeoutMs = 150,
 ): Promise<number | null> {
- if (!(await isProxyAlive(port))) return null;
- const ver = await getDaemonVersion(port);
- if (ver !== null && ver !== PKG_VERSION) {
-  if (await killStaleDaemon(port, ver, label)) {
-   return null;
-  }
-  if (await isProxyAlive(port)) return port;
-  return null;
- }
- return port;
+	if (!(await isProxyAlive(port, probeTimeoutMs))) return null;
+	const ver = await getDaemonVersion(port);
+	if (ver !== null && ver !== PKG_VERSION) {
+		logWarn(`detected proxy daemon version mismatch: running v${ver}, required v${PKG_VERSION} — auto-restarting`);
+		await killStaleDaemon(port, ver, label);
+		lastSpawnAt = 0;
+		return null;
+	}
+	return port;
 }
 
 /**
@@ -808,24 +810,9 @@ export async function ensureDaemon(): Promise<number> {
    return primary;
   }
 
-  if (PORT !== LEGACY_PORT) {
-   const legacy = await probeAndMaybeReplace(LEGACY_PORT, "legacy proxy daemon");
-   if (legacy !== null) {
-    await attachTo(legacy);
-    return legacy;
-   }
-  }
 
-  if (isSpawnEnabled()) {
-   // Cross-process race guard: a sibling session may be spawning right
-   // now (singleflight is per-process). Jitter + re-probe converts most
-   // cold-start races into attach instead of N detached spawns.
-   await new Promise<void>((r) => setTimeout(r, 100 + Math.random() * 200));
-   if (await isProxyAlive(PORT)) {
-    await attachTo(PORT);
-    return PORT;
-   }
-   const spawned = spawnDaemonProcess();
+		if (isSpawnEnabled()) {
+			const spawned = spawnDaemonProcess();
    if (spawned) {
     const ready = await waitForReady(PORT, DAEMON_READY_TIMEOUT_MS);
     if (ready) {

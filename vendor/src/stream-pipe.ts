@@ -15,7 +15,7 @@ import {
  WATCHDOG_SSE_MIN_SAMPLES,
  WATCHDOG_SSE_WINDOW,
 } from "./config.ts";
-import type { CaseRestoreMap, FindGlobRestore } from "./opencode-fingerprint.ts";
+import { cloakMessagesContent, type CaseRestoreMap, type FindGlobRestore } from "./opencode-fingerprint.ts";
 import { restoreToolNameForCaller } from "./tool-translation.ts";
 import { repairToolArguments } from "./tool-args.ts";
 
@@ -209,6 +209,52 @@ export function createSseStreamCloakState(): SseStreamCloakState {
   chatArgsByIndex: new Map(),
   messagesArgsByIndex: new Map(),
  };
+}
+
+/**
+ * Emit every tool call still holding buffered arguments, then clear the
+ * buffers. The fragments were withheld so the packet could be judged whole
+ * (see {@link SseStreamCloakState}); the terminal event that normally releases
+ * them never arrived when upstream cut the stream without one, and without
+ * this the client would receive a tool call whose `arguments` were deleted and
+ * never re-emitted. Repaired exactly as the terminal path repairs.
+ *
+ * Shape follows the pathname: Chat re-emits one `tool_calls` delta, Anthropic
+ * one `input_json_delta` per open block. Responses carries whole arguments on
+ * its `.done` event and buffers nothing, so it has nothing to flush.
+ * Returns null when nothing is buffered.
+ */
+export function flushBufferedToolArgs(
+ state: SseStreamCloakState,
+ cloak: StreamCloakOptions,
+): string | null {
+ if (state.messagesArgsByIndex.size > 0) {
+  const blocks: string[] = [];
+  for (const [index, args] of state.messagesArgsByIndex) {
+   const name = state.messagesNameByIndex.get(index) ?? "";
+   blocks.push(
+    `event: content_block_delta\ndata: ${JSON.stringify({
+     type: "content_block_delta",
+     index,
+     delta: { type: "input_json_delta", partial_json: repairToolArguments(name, args, cloak.argSchemas) },
+    })}\n\n`,
+   );
+  }
+  state.messagesArgsByIndex.clear();
+  state.messagesNameByIndex.clear();
+  return blocks.join("");
+ }
+ if (state.chatArgsByIndex.size === 0) return null;
+ const calls: unknown[] = [];
+ for (const [index, args] of state.chatArgsByIndex) {
+  const name = state.chatNameByIndex.get(index);
+  if (name === undefined) continue;
+  calls.push({ index, type: "function", function: { name, arguments: repairToolArguments(name, args, cloak.argSchemas) } });
+ }
+ state.chatArgsByIndex.clear();
+ state.chatNameByIndex.clear();
+ if (calls.length === 0) return null;
+ return `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: { tool_calls: calls } }] })}\n\n`;
 }
 
 /**
@@ -656,6 +702,27 @@ function rewriteMessagesBlock(
   const stopBlock = emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix);
   return `${emitSseBlock("content_block_delta", JSON.stringify(flushed), false)}\n\n${stopBlock}`;
  }
+ // A `message` frame carries a whole finished message mid-stream. It needs the
+ // same treatment the aggregate path gives it — injected tool_use dropped,
+ // caller names restored, inputs repaired — otherwise a placeholder call leaks
+ // downstream and a malformed one reaches the host unrepaired. Any block still
+ // buffering arguments is completed first so nothing is orphaned.
+ if (type === "message") {
+  const flushed = flushBufferedToolArgs(state, cloak);
+  cloakMessagesContent(parsed.message ?? parsed, cloak.callerHadTools, cloak.caseRestore, cloak.findGlob, cloak.injected, cloak.argSchemas);
+  if (flushed === null) return emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix);
+  return `${flushed}${emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix)}`;
+ }
+ // A tool_use block still holding buffered arguments is completed HERE, while
+ // its own event order is intact: `message_delta` / `message_stop` close the
+ // message, so the recovered `input_json_delta` has to precede them. (An
+ // end-of-stream flush would emit it after `message_stop`, where a strict
+ // Anthropic client has already closed the message.)
+ if (type === "message_delta" || type === "message_stop") {
+  const flushed = flushBufferedToolArgs(state, cloak);
+  if (flushed === null) return block;
+  return `${flushed}${emitSseBlock(event, JSON.stringify(parsed), hadEventPrefix)}`;
+ }
  return block;
 }
 
@@ -1099,6 +1166,15 @@ export function pipeUpstreamStream(
     }
    }
   }
+ // Buffered tool arguments are released on the call's terminal event, which a
+ // cut stream never sends. Flush them here: the client already saw the call
+ // announced, so it must receive the arguments too rather than a name with no
+ // payload. Runs before the terminal-marker decision and before the re-fire
+ // offer, because a rescue regenerates the turn and would double the calls.
+ if (cloakState && cloak) {
+  const flushed = flushBufferedToolArgs(cloakState, cloak);
+  if (flushed !== null) forwardText(flushed);
+ }
   if (hasTerminalEvent) recordOnce(false);
   const elapsed = ((Date.now() - startAt) / 1000).toFixed(1);
   if (!hasTerminalEvent && totalChunks > 0) {
@@ -1140,6 +1216,14 @@ export function pipeUpstreamStream(
   // inject a terminal nor end res — the replacement stream owns the turn now.
   if (refirePending) return;
   try {
+  // Same obligation as the clean-end flush: the client already saw the call
+  // announced, so its buffered arguments must still arrive before the turn is
+  // terminated — and before the re-fire offer, since a rescue regenerates the
+  // turn and would double the calls.
+  if (cloakState && cloak) {
+   const flushed = flushBufferedToolArgs(cloakState, cloak);
+   if (flushed !== null) forwardText(flushed);
+  }
    if (!hasTerminalEvent && totalChunks > 0) {
     if (clientAborted || upstreamEnded) {
      // Client disconnect teardown or post-end cleanup — the relay

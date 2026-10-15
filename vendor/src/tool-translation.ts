@@ -53,7 +53,17 @@ export const PI_TOOL_NAMES = [
  "ls",
 ] as const;
 
-/** OMP host built-ins: BUILTIN_TOOL_NAMES in reference/oh-my-pi packages/coding-agent/src/tools/builtin-names.ts plus browser/computer */
+/**
+ * OMP host built-ins: BUILTIN_TOOL_NAMES in
+ * reference/oh-my-pi/packages/coding-agent/src/tools/builtin-names.ts, plus
+ * browser/computer (real top-level tools in the same checkout) and `hub`.
+ *
+ * `find` here is OMP's semantic search (reference/oh-my-pi
+ * tools/jfind/index.ts:54), NOT Pi's file finder: they are different tools
+ * with different schemas, and both are declared together whenever the session
+ * enables it. That is why the translator renames `find` to `glob` only when the
+ * caller left the `glob` slot empty — see translateToolsForPath.
+ */
 export const OMP_TOOL_NAMES = [
  "read",
  "bash",
@@ -62,15 +72,20 @@ export const OMP_TOOL_NAMES = [
  "ast_edit",
  "ask",
  "debug",
+ "ida",
  "eval",
  "github",
  "glob",
  "grep",
+ "find",
  "lsp",
  "checkpoint",
  "rewind",
+ "context_notes",
+ "new_context",
  "security_scan",
  "task",
+ "wait",
  "hub",
  "todo",
  "web_search",
@@ -213,13 +228,20 @@ export const OMP_CALLER_MARKERS = ["ask", "task", "todo", "hub", "lsp"] as const
 
 /**
  * True when a lowercased caller-tool name set looks like OMP: any of
- * ask/task/todo/hub/lsp present, or glob present without find (Pi sends find,
- * OMP sends glob). Case-insensitive; pass already-lowercased names.
+ * ask/task/todo/hub/lsp present, or `glob` present at all.
+ *
+ * `glob` alone is the discriminator because Pi has no such tool (its file
+ * finder is `find`, reference/pi core/tools/index.ts:95) while OMP declares
+ * both. The old test was "glob without find", which assumed `find` was
+ * Pi-exclusive; OMP ships a semantic `find` too (reference/oh-my-pi
+ * tools/jfind/index.ts:54), so an OMP read-only session carrying glob+find was
+ * classified as Pi and its fingerprint slots came back as non-executable
+ * placeholders. Case-insensitive; pass already-lowercased names.
  */
 export function isOmpLikeCaller(lowerNames: Iterable<string>): boolean {
  const set = lowerNames instanceof Set ? lowerNames : new Set(lowerNames);
  for (const m of OMP_CALLER_MARKERS) if (set.has(m)) return true;
- return set.has("glob") && !set.has("find");
+ return set.has("glob");
 }
 
 export interface CanonicalTool {
@@ -365,31 +387,109 @@ export function upstreamToolNameFor(name: string): string {
  return isFindToolName(name) ? "glob" : name.trim();
 }
 /**
- * Restore record for the find->glob rename. True only when the caller sent
- * `find` (any case) without also sending `glob`: the single upstream `glob`
- * unambiguously stands for the caller `find`. When the caller sent both,
- * upstream collapses to one `glob` (first-seen wins) and no restore applies.
+ * Restore records for the upstream-name rewrites: `find`->`glob` and the
+ * sanitization of names upstream rejects. `renamed` maps every rewritten
+ * upstream name (lowercased) back to the caller's original, so an emitted
+ * call still resolves to the tool the caller actually registered.
+ *
+ * `renamedFindToGlob` is true only when the caller sent `find` (any case)
+ * without also sending `glob`: the single upstream `glob` unambiguously stands
+ * for the caller `find`. When the caller sent both, upstream collapses to one
+ * `glob` (first-seen wins) and no single-name restore applies.
  */
 export interface FindGlobRestore {
- renamedFindToGlob: boolean;
+	renamedFindToGlob: boolean;
+	/** Sanitized upstream name (lowercased) -> caller name. Absent when every
+	 * caller name was already upstream-legal, so nothing was rewritten. */
+	renamed?: Record<string, string>;
 }
-/** Inspect the original caller tools (pre-translate) for the find->glob case. */
+
+/**
+ * Upstream accepts only `^[a-zA-Z0-9_.-]+$` as a tool name and answers
+ * `400 \`name\` must match` otherwise. Hosts do send such names — measured in
+ * live Pi sessions: `TG drive` (space), `env:production` (colon) — so the
+ * whole request dies on one badly named tool.
+ *
+ * Every character outside the allowed set folds to `_`, and a collision with
+ * an already-emitted name gets a numeric suffix. The caller name is recorded
+ * so `restoreToolNameForCaller` puts it back; the model never sees a name it
+ * cannot match against its own earlier call. A name that already matches is
+ * returned unchanged, so well-formed tool sets are untouched.
+ */
+const UPSTREAM_NAME_SHAPE = /^[a-zA-Z0-9_.-]+$/;
+
+/**
+ * Fold one caller tool name to a shape upstream accepts. Deterministic, and a
+ * pure function of the name: the same input always sanitizes to the same
+ * output, which is what lets the caller name be recovered downstream.
+ */
+export function sanitizeUpstreamToolName(name: string, taken: ReadonlySet<string>): string {
+	const trimmed = name.trim();
+	if (UPSTREAM_NAME_SHAPE.test(trimmed)) return trimmed;
+	let folded = trimmed.replace(/[^a-zA-Z0-9_.-]/g, "_");
+	// A name made entirely of invalid characters would sanitize to a leading
+	// run of underscores and collide with every other such name; anchor it.
+	if (folded.length === 0) folded = "tool";
+	let candidate = folded;
+	let n = 2;
+	while (taken.has(candidate.toLowerCase())) {
+		candidate = `${folded}_${n}`;
+		n += 1;
+	}
+	return candidate;
+}
+/** Inspect the original caller tools (pre-translate) for the rewrite cases. */
 export function buildFindGlobRestore(callerTools: unknown[]): FindGlobRestore {
- let sawFind = false;
- let sawGlob = false;
- for (const tool of callerTools) {
-  const canon = canonicalizeTool(tool);
-  if (!canon) continue;
-  if (isFindToolName(canon.name)) sawFind = true;
-  else if (canon.name.trim().toLowerCase() === "glob") sawGlob = true;
-  if (sawFind && sawGlob) break;
- }
- return { renamedFindToGlob: sawFind && !sawGlob };
+	// Same rule as translateToolsForPath: the find->glob rename fires only when
+	// the caller left the `glob` slot empty. OMP declares both real tools, so
+	// there the rename must not happen and `find` must keep its own name.
+	const callerDeclaresGlob = callerTools.some((tool) => {
+		const canon = canonicalizeTool(tool);
+		return canon !== null && canon.name.trim().toLowerCase() === "glob";
+	});
+	const nameFor = (name: string): string => (callerDeclaresGlob ? name.trim() : upstreamToolNameFor(name));
+	const renamed: Record<string, string> = {};
+	// Same first-seen-wins order and case rules as translateToolsForPath, so
+	// the recorded map keys match the names that actually reach upstream.
+	const seen = new Set<string>();
+	for (const tool of callerTools) {
+		const canon = canonicalizeTool(tool);
+		if (!canon) continue;
+		const callerName = canon.name;
+		const upstreamName = nameFor(callerName);
+		// Mirrors translateToolsForPath: dedup on the lowercased
+		// pre-sanitization name (a collapsed duplicate never reaches upstream),
+		// then sanitize with the caller's casing intact.
+		const dedupKey = upstreamName.toLowerCase();
+		if (seen.has(dedupKey)) continue;
+		seen.add(dedupKey);
+		const sanitized = sanitizeUpstreamToolName(upstreamName, seen);
+		if (sanitized.toLowerCase() !== dedupKey) seen.add(sanitized.toLowerCase());
+		// Only character-folding rewrites belong in the sanitized map. The
+		// find->glob rename is a single-name fallback, so a name that came in
+		// as `find` must not be recorded here: upstream `glob` may be the
+		// caller's own glob.
+		if (sanitized !== callerName && !isFindToolName(callerName)) {
+			renamed[sanitized.toLowerCase()] = callerName;
+		}
+	}
+	const sawFind = callerTools.some((tool) => {
+		const canon = canonicalizeTool(tool);
+		return canon !== null && isFindToolName(canon.name);
+	});
+	const restored: FindGlobRestore = { renamedFindToGlob: sawFind && !callerDeclaresGlob, renamed };
+	return restored;
 }
-/** Downstream name: map the upstream `glob` back to caller `find` when renamed. */
+/**
+ * Downstream name: undo the upstream rewrites. The sanitized map is checked
+ * first because it is keyed by the exact name upstream saw; the find->glob
+ * case stays as the single-name fallback.
+ */
 export function restoreToolNameForCaller(name: string, restore: FindGlobRestore): string {
- if (restore.renamedFindToGlob && name.trim().toLowerCase() === "glob") return "find";
- return name;
+	const sanitized = restore.renamed?.[name.trim().toLowerCase()];
+	if (sanitized !== undefined) return sanitized;
+	if (restore.renamedFindToGlob && name.trim().toLowerCase() === "glob") return "find";
+	return name;
 }
 function retargetChoice(value: unknown, from: string, to: string): unknown {
  if (typeof value === "string") {
@@ -453,22 +553,46 @@ function carryExtraFields(
  }
 }
 /**
- * Reshape a caller tool array for the target path. Tools already in the
- * target shape pass through verbatim (identical reference, every extra field
- * intact) except Pi `find`, which is renamed to `glob` even when the shape
- * already matches (new object, params/description verbatim). Function tools
- * in another shape are converted, carrying `description`/`parameters`/`strict`
- * verbatim plus every other top-level caller field except the
- * wire-shape-forbidden keys (`type`/`function` wrapper, `name`, `description`,
- * `parameters`/`input_schema`), which are remapped per target shape. Never
- * injects `additionalProperties`. Every other entry passes through verbatim.
- * Duplicates collapse first-seen-wins on the lowercased upstream name, so
- * `Bash` never duplicates `bash` and `find` collapses with `glob`.
- * Re-translating translated output adds zero tools. Never returns null entries.
+ * Reshape a caller tool array for the target path. Tools already in the target
+ * shape pass through verbatim (identical reference, every extra field intact).
+ * Function tools in another shape are converted, carrying
+ * `description`/`parameters`/`strict` verbatim plus every other top-level
+ * caller field except the wire-shape-forbidden keys (`type`/`function`
+ * wrapper, `name`, `description`, `parameters`/`input_schema`), which are
+ * remapped per target shape. Never injects `additionalProperties`. Every other
+ * entry passes through verbatim. Duplicates collapse first-seen-wins on the
+ * lowercased upstream name, so `Bash` never duplicates `bash`. Re-translating
+ * translated output adds zero tools. Never returns null entries.
  * `tool_choice` is never imposed here; use the retarget helpers to carry it.
+ *
+ * Names ride the caller's own unless `forFingerprint` is set — that flag exists
+ * for the OpenCode free tier alone, whose gate expects the sextet name `glob`
+ * and therefore needs Pi's `find` renamed into it. On every other lane the
+ * rename is pure loss: the upstream would have accepted `find`, and the host
+ * gets `find` back and dispatches it natively.
  */
-export function translateToolsForPath(tools: unknown[], pathname: string): Record<string, unknown>[] {
+export function translateToolsForPath(tools: unknown[], pathname: string, opts?: { forFingerprint?: boolean }): Record<string, unknown>[] {
  const api = apiForPathname(pathname);
+ // Only the OpenCode free tier needs a tool renamed: its gate looks for a
+ // sextet whose `glob` slot Pi's `find` can fill. Every other upstream accepts
+ // the caller's own names, so on those lanes the name rides verbatim in BOTH
+ // directions and the host dispatches it natively — nothing to translate, and
+ // nothing to restore.
+ //
+ // Even on the fingerprint lane the rename is skipped when the caller declared
+ // `glob` itself: OMP declares both `glob` (file patterns) and `find`
+ // (semantic search, reference/oh-my-pi tools/jfind/index.ts:54), and renaming
+ // there would collapse two real tools into one under the other's schema.
+ let callerDeclaresGlob = false;
+ for (const tool of tools) {
+  const canon = canonicalizeTool(tool);
+  if (canon && canon.name.trim().toLowerCase() === "glob") {
+   callerDeclaresGlob = true;
+   break;
+  }
+ }
+ const renameFind = opts?.forFingerprint === true && !callerDeclaresGlob;
+ const upstreamNameFor = (name: string): string => (renameFind ? upstreamToolNameFor(name) : name.trim());
  const seen = new Set<string>();
  const out: Record<string, unknown>[] = [];
  for (const tool of tools) {
@@ -480,72 +604,37 @@ export function translateToolsForPath(tools: unknown[], pathname: string): Recor
    out.push(rec);
    continue;
   }
-  const upstreamName = upstreamToolNameFor(canon.name);
-  const key = upstreamName.toLowerCase();
-  if (seen.has(key)) continue;
-  seen.add(key);
-  const needsRename = upstreamName !== canon.name;
-  if (!needsRename && alreadyTargetShape(rec, api)) {
-   out.push(rec);
-   continue;
-  }
-  const renamed: CanonicalTool = needsRename
-   ? { ...canon, name: upstreamName }
-   : canon;
-  const converted =
-   api === "responses"
-    ? toResponsesTool(renamed)
-    : api === "messages"
-     ? toAnthropicTool(renamed)
-     : toChatTool(renamed);
-  carryExtraFields(rec, converted);
-  out.push(converted);
+ // Duplicate collapse stays first-seen-wins on the lowercased upstream name
+ // (`Bash` never duplicates `bash`, a Pi `find` still collapses with `glob`)
+ // and runs on the pre-sanitization name: the emitted name keeps the caller's
+ // casing, and the sanitizer only ever folds characters the upstream shape
+ // forbids.
+ const dedupKey = upstreamNameFor(canon.name).toLowerCase();
+ if (seen.has(dedupKey)) continue;
+ seen.add(dedupKey);
+ // The find->glob rename and the name sanitization share one upstream name,
+ // so a caller tool needing either is emitted under a single new name.
+ const upstreamName = sanitizeUpstreamToolName(upstreamNameFor(canon.name), seen);
+ if (upstreamName.toLowerCase() !== dedupKey) seen.add(upstreamName.toLowerCase());
+ const needsRename = upstreamName !== canon.name;
+ if (!needsRename && alreadyTargetShape(rec, api)) {
+  out.push(rec);
+  continue;
+ }
+ const renamed: CanonicalTool = needsRename
+  ? { ...canon, name: upstreamName }
+  : canon;
+ const converted =
+  api === "responses"
+   ? toResponsesTool(renamed)
+   : api === "messages"
+    ? toAnthropicTool(renamed)
+    : toChatTool(renamed);
+ carryExtraFields(rec, converted);
+ out.push(converted);
  }
  return out;
 }
-/**
- * Inject the missing fingerprint tools into an already-translated tool array,
- * using the target path's shape. Idempotent and case-insensitive: `Bash`
- * satisfies `bash` and is never duplicated.
- * OMP-like callers (explicit `ompLike`, else auto-detected from the array via
- * {@link isOmpLikeCaller}) get REAL minimal executable definitions from
- * {@link OMP_FINGERPRINT_DEFS}; everyone else (Pi) keeps the empty COMPAT
- * placeholders. `edit` is always the COMPAT placeholder, even for OMP-like
- * callers — no static edit def executes on either host, so it must stay
- * cloaked downstream. Re-injecting injected output adds zero tools.
- */
-export function injectFingerprintTools(
- tools: Record<string, unknown>[],
- pathname: string,
- ompLike?: boolean,
-): Record<string, unknown>[] {
- const present = new Set<string>();
- for (const tool of tools) {
-  const canon = canonicalizeTool(tool);
-  if (canon) present.add(canon.name.trim().toLowerCase());
- }
- const omp = ompLike ?? isOmpLikeCaller(present);
- const api = apiForPathname(pathname);
- for (const name of OPENCODE_FINGERPRINT_TOOLS) {
-  if (present.has(name.toLowerCase())) continue;
-  const def = omp && name !== "edit" ? OMP_FINGERPRINT_DEFS[name] : null;
-  const canon: CanonicalTool = {
-   name,
-   description: def ? def.description : COMPAT_TOOL_DESCRIPTION,
-   parameters: def ? { ...(def.parameters as Record<string, unknown>) } : { type: "object", properties: {} },
-  };
-  tools.push(
-   api === "responses"
-    ? toResponsesTool(canon)
-    : api === "messages"
-     ? toAnthropicTool(canon)
-     : toChatTool(canon),
-  );
-  present.add(name.toLowerCase());
- }
- return tools;
-}
-
 /**
  * Responses <-> Chat body translation. Cline serves chat completions only, so
  * the responses body is reshaped to chat before the Cline branch sends it,
@@ -617,8 +706,11 @@ export function responsesInputToChatMessages(input: unknown): Record<string, unk
  * instructions (as the leading system message), input, tools (reshaped to
  * chat via translateToolsForPath), tool_choice, and plain sampling scalars.
  * Stream policy stays with the caller: this maps shape, never behavior.
+ *
+ * Lane-neutral: used by every direct-only lane that serves chat upstream and
+ * answers a responses-path caller (Cline, OVHcloud AI Endpoints).
  */
-export function clineChatBodyFromResponsesBody(body: Record<string, unknown>): Record<string, unknown> {
+export function chatBodyFromResponsesBody(body: Record<string, unknown>): Record<string, unknown> {
  const out: Record<string, unknown> = {};
  if (typeof body.model === "string") out.model = body.model;
  const messages: Record<string, unknown>[] = [];
@@ -629,7 +721,10 @@ export function clineChatBodyFromResponsesBody(body: Record<string, unknown>): R
  out.messages = messages;
  if (Array.isArray(body.tools)) out.tools = translateToolsForPath(body.tools, "/v1/chat/completions");
  if (body.tool_choice !== undefined) out.tool_choice = body.tool_choice;
- for (const key of ["temperature", "top_p", "max_tokens", "max_completion_tokens", "stop", "presence_penalty", "frequency_penalty", "seed", "user", "parallel_tool_calls", "response_format"] as const) {
+ // `max_output_tokens` is the Responses-native cap and is what a host actually
+ // sets on this path; without it here the cap silently vanished on the
+ // chat-only lanes and the model answered at its own default length.
+ for (const key of ["temperature", "top_p", "max_tokens", "max_completion_tokens", "max_output_tokens", "stop", "presence_penalty", "frequency_penalty", "seed", "user", "parallel_tool_calls", "response_format"] as const) {
   if (body[key] !== undefined) out[key] = body[key];
  }
  return out;
@@ -690,13 +785,56 @@ export function chatResponsesJsonFromChatCompletion(chat: Record<string, unknown
 /**
  * Wrap a Responses object in the minimal valid Responses SSE sequence
  * (created + completed + DONE) so streamed responses-path clients get a
- * stream even though Cline only serves chat upstream. Round-trips through
+ * stream even though the upstream lane only serves chat. Round-trips through
  * sseToResponsesJson: the completed event carries the full object.
  */
 export function chatResponsesSseFromChatCompletion(resp: Record<string, unknown>): string {
  const head = { type: "response.created", response: { id: resp.id, object: "response", model: resp.model } };
+ let out = `event: response.created\ndata: ${JSON.stringify(head)}\n\n`;
+ const output = resp.output;
+ if (Array.isArray(output)) {
+  for (let idx = 0; idx < output.length; idx++) {
+   const item = output[idx] as Record<string, unknown>;
+   if (item && item.type === "message" && Array.isArray(item.content)) {
+    for (const part of item.content) {
+     const p = part as Record<string, unknown>;
+     if (p && p.type === "output_text" && typeof p.text === "string" && p.text.length > 0) {
+      out += `event: response.output_text.delta\ndata: ${JSON.stringify({
+       type: "response.output_text.delta",
+       output_index: idx,
+       delta: p.text,
+      })}\n\n`;
+     }
+    }
+   } else if (item && item.type === "function_call") {
+    out += `event: response.output_item.added\ndata: ${JSON.stringify({
+     type: "response.output_item.added",
+     output_index: idx,
+     item: {
+      type: "function_call",
+      id: item.id,
+      call_id: item.call_id,
+      name: item.name,
+      arguments: "",
+     },
+    })}\n\n`;
+    if (typeof item.arguments === "string" && item.arguments.length > 0) {
+     out += `event: response.function_call_arguments.delta\ndata: ${JSON.stringify({
+      type: "response.function_call_arguments.delta",
+      output_index: idx,
+      delta: item.arguments,
+     })}\n\n`;
+    }
+    out += `event: response.output_item.done\ndata: ${JSON.stringify({
+     type: "response.output_item.done",
+     output_index: idx,
+     item,
+    })}\n\n`;
+   }
+  }
+ }
  const done = { type: "response.completed", response: resp };
- return `event: response.created\ndata: ${JSON.stringify(head)}\n\n` +
-  `event: response.completed\ndata: ${JSON.stringify(done)}\n\n` +
-  `data: [DONE]\n\n`;
+ out += `event: response.completed\ndata: ${JSON.stringify(done)}\n\n`;
+ out += `data: [DONE]\n\n`;
+ return out;
 }
